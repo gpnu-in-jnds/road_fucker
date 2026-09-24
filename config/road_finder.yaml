@@ -1,0 +1,37 @@
+%YAML:1.0
+---
+input_width: 1280
+input_height: 720
+process_width: 640
+process_height: 360
+# Fractions of the processing image, after optional perspective warp.
+roi_fraction: [0.02, 0.12, 0.96, 0.85]
+
+# OpenCV HSV: H 0..179, S/V 0..255. Calibrate these from live video.
+# The broad defaults admit grey road pixels while the adaptive road/background
+# models and connected-region checks supply the additional discrimination.
+road_hsv: [0, 179, 0, 70, 35, 220]
+equalize_value: 0
+color_distance_max: 85.0
+color_background_ratio: 1.15
+chroma_row_ratio: 0.20
+chroma_min_contrast: 3.0
+edge_min_score: 3.5
+# Straight-road robust line fit; pixel distances use the 640x360 process image.
+edge_line_residual_px: 8.0
+edge_min_inlier_ratio: 0.48
+edge_min_span_fraction: 0.28
+morphology_pixels: 3
+max_white_gap_width_ratio: 0.22
+min_road_width_fraction: 0.08
+max_road_width_fraction: 0.92
+junction_min_arm_widths: 0.65
+junction_vote_frames: 3
+junction_vote_window: 5
+lookahead_fraction: 0.55
+minimum_confidence: 0.38
+
+# Add both point sets to enable a perspective transform. Coordinates use the
+# original 1280x720 image and must be ordered TL, TR, BR, BL. Example:
+# perspective_src: [[430, 120], [930, 120], [1220, 700], [60, 700]]
+# perspective_dst: [[400, 120], [880, 120], [880, 700], [400, 700]]

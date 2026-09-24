@@ -1,0 +1,921 @@
+#include "road_finder/road_detector.hpp"
+
+#include <opencv2/imgproc.hpp>
+#if CV_VERSION_MAJOR >= 5
+#include <opencv2/geometry/2d.hpp>
+#include <opencv2/geometry/3d.hpp>
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
+#include <queue>
+#include <stdexcept>
+
+namespace road_finder {
+namespace {
+
+template <typename T>
+void readValue(const cv::FileNode& node, const char* key, T& value) {
+  if (!node[key].empty()) node[key] >> value;
+}
+
+std::array<cv::Point2f, 4> readPoints(const cv::FileNode& node) {
+  if (node.size() != 4) throw std::runtime_error("perspective points need four [x,y] pairs");
+  std::array<cv::Point2f, 4> points{};
+  for (int i = 0; i < 4; ++i) {
+    if (node[i].size() != 2) throw std::runtime_error("invalid perspective point");
+    points[i].x = static_cast<float>((double)node[i][0]);
+    points[i].y = static_cast<float>((double)node[i][1]);
+  }
+  return points;
+}
+
+cv::Scalar medianHsv(const cv::Mat& hsv, cv::Rect rect) {
+  rect &= cv::Rect(0, 0, hsv.cols, hsv.rows);
+  if (rect.empty()) return cv::Scalar(0, 0, 0);
+  std::array<std::vector<int>, 3> channels;
+  for (int y = rect.y; y < rect.y + rect.height; ++y) {
+    for (int x = rect.x; x < rect.x + rect.width; ++x) {
+      const auto pixel = hsv.at<cv::Vec3b>(y, x);
+      for (int c = 0; c < 3; ++c) channels[c].push_back(pixel[c]);
+    }
+  }
+  cv::Scalar result;
+  for (int c = 0; c < 3; ++c) {
+    auto& values = channels[c];
+    std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
+    result[c] = values[values.size() / 2];
+  }
+  return result;
+}
+
+float hsvDistance(const cv::Vec3b& pixel, const cv::Scalar& model) {
+  const float s = static_cast<float>(pixel[1]);
+  const float model_s = static_cast<float>(model[1]);
+  float hue = std::abs(static_cast<float>(pixel[0] - model[0]));
+  hue = std::min(hue, 180.0f - hue);
+  if (s < 15.0f || model_s < 15.0f) hue = 0.0f;
+  const float ds = s - model_s;
+  const float dv = static_cast<float>(pixel[2] - model[2]);
+  return std::sqrt(0.6f * hue * hue + 0.7f * ds * ds + dv * dv);
+}
+
+bool withinHsv(const cv::Vec3b& p, const HsvRange& r) {
+  const bool hue = r.h_min <= r.h_max ? (p[0] >= r.h_min && p[0] <= r.h_max)
+                                     : (p[0] >= r.h_min || p[0] <= r.h_max);
+  return (p[1] < 15 || hue) && p[1] >= r.s_min && p[1] <= r.s_max &&
+         p[2] >= r.v_min && p[2] <= r.v_max;
+}
+
+cv::Mat keepBottomConnected(const cv::Mat& mask) {
+  cv::Mat labels, stats, centroids;
+  const int count = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8);
+  int best = -1;
+  std::vector<int> seed_counts(count, 0);
+  const int y_start = mask.rows * 4 / 5;
+  const int x0 = mask.cols / 3;
+  const int x1 = mask.cols * 2 / 3;
+  for (int y = y_start; y < mask.rows; ++y)
+    for (int x = x0; x < x1; ++x)
+      ++seed_counts[labels.at<int>(y, x)];
+  int best_seeds = 0;
+  for (int label = 1; label < count; ++label) {
+    const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+    if (seed_counts[label] > best_seeds && area > static_cast<int>(mask.total() / 500)) {
+      best = label;
+      best_seeds = seed_counts[label];
+    }
+  }
+  cv::Mat selected = cv::Mat::zeros(mask.size(), CV_8UC1);
+  if (best > 0) selected.setTo(255, labels == best);
+  return selected;
+}
+
+int neighborCount(const cv::Mat& binary, int y, int x) {
+  int count = 0;
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      if ((dx || dy) && binary.at<uchar>(y + dy, x + dx)) ++count;
+    }
+  }
+  return count;
+}
+
+cv::Mat thin(const cv::Mat& mask) {
+  cv::Mat binary;
+  cv::threshold(mask, binary, 0, 1, cv::THRESH_BINARY);
+  binary.row(0).setTo(0);
+  binary.row(binary.rows - 1).setTo(0);
+  binary.col(0).setTo(0);
+  binary.col(binary.cols - 1).setTo(0);
+  cv::Mat marker = cv::Mat::zeros(binary.size(), CV_8UC1);
+  for (int iteration = 0; iteration < 120; ++iteration) {
+    int changed = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+      marker.setTo(0);
+      for (int y = 1; y < binary.rows - 1; ++y) {
+        for (int x = 1; x < binary.cols - 1; ++x) {
+          if (!binary.at<uchar>(y, x)) continue;
+          const int p2 = binary.at<uchar>(y - 1, x), p3 = binary.at<uchar>(y - 1, x + 1);
+          const int p4 = binary.at<uchar>(y, x + 1), p5 = binary.at<uchar>(y + 1, x + 1);
+          const int p6 = binary.at<uchar>(y + 1, x), p7 = binary.at<uchar>(y + 1, x - 1);
+          const int p8 = binary.at<uchar>(y, x - 1), p9 = binary.at<uchar>(y - 1, x - 1);
+          const int n = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+          const int transitions = (!p2 && p3) + (!p3 && p4) + (!p4 && p5) +
+                                  (!p5 && p6) + (!p6 && p7) + (!p7 && p8) +
+                                  (!p8 && p9) + (!p9 && p2);
+          if (n < 2 || n > 6 || transitions != 1) continue;
+          const bool protect_a = pass == 0 ? p2 * p4 * p6 : p2 * p4 * p8;
+          const bool protect_b = pass == 0 ? p4 * p6 * p8 : p2 * p6 * p8;
+          if (!protect_a && !protect_b) marker.at<uchar>(y, x) = 1;
+        }
+      }
+      changed += cv::countNonZero(marker);
+      binary.setTo(0, marker);
+    }
+    if (!changed) break;
+  }
+  return binary;
+}
+
+struct Topology {
+  RoadType type = RoadType::STRAIGHT;
+  unsigned directions = STRAIGHT;
+};
+
+Topology topologyFromMask(const cv::Mat& mask, float road_width,
+                          const Config& config) {
+  const cv::Size small_size(std::max(40, mask.cols / 4), std::max(30, mask.rows / 4));
+  cv::Mat small, skeleton;
+  cv::resize(mask, small, small_size, 0, 0, cv::INTER_NEAREST);
+  skeleton = thin(small);
+  const float scale = static_cast<float>(small.cols) / mask.cols;
+  const float min_length = std::max(5.0f, road_width * scale * config.junction_min_arm_widths);
+  std::vector<cv::Point> endpoints;
+  cv::Mat branches = cv::Mat::zeros(skeleton.size(), CV_8UC1);
+  for (int y = 1; y < skeleton.rows - 1; ++y) {
+    for (int x = 1; x < skeleton.cols - 1; ++x) {
+      if (!skeleton.at<uchar>(y, x)) continue;
+      const int degree = neighborCount(skeleton, y, x);
+      if (degree == 1) endpoints.emplace_back(x, y);
+      if (degree >= 3) branches.at<uchar>(y, x) = 255;
+    }
+  }
+
+  // Adjacent branch pixels form one junction. Removing the complete cluster
+  // separates its arms so that small skeleton artifacts cannot count as roads.
+  cv::Mat branch_labels, branch_stats, branch_centroids;
+  const int branch_count = cv::connectedComponentsWithStats(
+      branches, branch_labels, branch_stats, branch_centroids, 8);
+  int junction = -1;
+  for (int label = 1; label < branch_count; ++label) {
+    const int y = branch_stats.at<int>(label, cv::CC_STAT_TOP);
+    if (y < small.rows / 8 || y > small.rows * 4 / 5) continue;
+    if (junction < 0 || y > branch_stats.at<int>(junction, cv::CC_STAT_TOP))
+      junction = label;
+  }
+  if (junction > 0) {
+    cv::Mat cluster = branch_labels == junction;
+    cv::dilate(cluster, cluster, cv::Mat::ones(3, 3, CV_8UC1));
+    cv::Mat arms = skeleton.clone();
+    arms.setTo(0, cluster);
+    cv::Mat labels, stats, centroids;
+    const int count = cv::connectedComponentsWithStats(arms, labels, stats, centroids, 8);
+    const cv::Point2f center(static_cast<float>(branch_centroids.at<double>(junction, 0)),
+                             static_cast<float>(branch_centroids.at<double>(junction, 1)));
+    bool left = false, straight = false, right = false;
+    bool incoming = false;
+    for (int label = 1; label < count; ++label) {
+      float far_distance = 0.0f;
+      cv::Point far;
+      bool touches_cluster = false;
+      for (int y = 1; y < arms.rows - 1; ++y) {
+        for (int x = 1; x < arms.cols - 1; ++x) {
+          if (labels.at<int>(y, x) != label) continue;
+          const float distance = cv::norm(cv::Point2f(x, y) - center);
+          if (distance > far_distance) {
+            far_distance = distance;
+            far = {x, y};
+          }
+          if (cluster.at<uchar>(y, x)) touches_cluster = true;
+          for (int dy = -1; dy <= 1 && !touches_cluster; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+              if (cluster.at<uchar>(y + dy, x + dx)) touches_cluster = true;
+        }
+      }
+      if (!touches_cluster || far_distance < min_length) continue;
+      const float dx = far.x - center.x;
+      const float dy = far.y - center.y;
+      if (dy > min_length * 0.65f && std::abs(dx) < dy * 1.3f) incoming = true;
+      else if (dx < -min_length * 0.55f && std::abs(dx) > std::abs(dy) * 0.65f) left = true;
+      else if (dx > min_length * 0.55f && std::abs(dx) > std::abs(dy) * 0.65f) right = true;
+      else if (dy < -min_length * 0.55f) straight = true;
+    }
+    // An upper arm can be disconnected from the branch cluster by thinning
+    // around a broad side junction. Confirm it in the original occupancy mask.
+    const int probe = std::max(static_cast<int>(std::ceil(min_length * 1.2f)),
+                               static_cast<int>(std::ceil(road_width * scale * 0.65f)));
+    const int px = static_cast<int>(std::round(center.x));
+    const int py = static_cast<int>(std::round(center.y)) - probe;
+    if (!straight && py >= 2 && py < small.rows - 2 && px >= 2 && px < small.cols - 2) {
+      const cv::Rect sample(px - 2, py - 2, 5, 5);
+      if (cv::countNonZero(small(sample)) >= 15) straight = true;
+    }
+    if (incoming) {
+      if (left && right && !straight) return {RoadType::T_JUNCTION, LEFT | RIGHT};
+      if (left && straight && !right) return {RoadType::LEFT_BRANCH, LEFT | STRAIGHT};
+      if (right && straight && !left) return {RoadType::RIGHT_BRANCH, RIGHT | STRAIGHT};
+    }
+  }
+
+  // A bend has no branch node. Use the outgoing arm's local tangent rather
+  // than its total displacement, which is perspective-dependent.
+  if (endpoints.size() == 2) {
+    const cv::Point incoming = endpoints[0].y > endpoints[1].y ? endpoints[0] : endpoints[1];
+    const cv::Point outgoing = endpoints[0].y > endpoints[1].y ? endpoints[1] : endpoints[0];
+    if (incoming.y > small.rows * 2 / 3) {
+      cv::Point current = outgoing, previous(-1, -1);
+      const int steps = static_cast<int>(std::max(5.0f, min_length));
+      for (int i = 0; i < steps; ++i) {
+        cv::Point next(-1, -1);
+        for (int dy = -1; dy <= 1 && next.x < 0; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            const cv::Point p = current + cv::Point(dx, dy);
+            if ((!dx && !dy) || p == previous || p.x <= 0 || p.y <= 0 ||
+                p.x >= skeleton.cols - 1 || p.y >= skeleton.rows - 1) continue;
+            if (skeleton.at<uchar>(p)) { next = p; break; }
+          }
+        }
+        if (next.x < 0) break;
+        previous = current;
+        current = next;
+      }
+      const float dx = outgoing.x - current.x;
+      const float dy = outgoing.y - current.y;
+      if (std::abs(dx) > std::max(4.0f, std::abs(dy) * 1.4f)) {
+        if (dx < 0) return {RoadType::LEFT_TURN, LEFT};
+        return {RoadType::RIGHT_TURN, RIGHT};
+      }
+    }
+  }
+  return {};
+}
+
+bool fitQuadratic(const std::vector<cv::Point2f>& points, cv::Vec3d& coeff) {
+  if (points.size() < 4) return false;
+  cv::Mat a(static_cast<int>(points.size()), 3, CV_64F);
+  cv::Mat b(static_cast<int>(points.size()), 1, CV_64F);
+  for (int i = 0; i < a.rows; ++i) {
+    const double y = points[i].y;
+    a.at<double>(i, 0) = 1;
+    a.at<double>(i, 1) = y;
+    a.at<double>(i, 2) = y * y;
+    b.at<double>(i) = points[i].x;
+  }
+  cv::Mat solution;
+  if (!cv::solve(a, b, solution, cv::DECOMP_SVD)) return false;
+  coeff = {solution.at<double>(0), solution.at<double>(1), solution.at<double>(2)};
+  return true;
+}
+
+float eval(const cv::Vec3d& c, float y) {
+  return static_cast<float>(c[0] + c[1] * y + c[2] * y * y);
+}
+
+struct LinearModel {
+  double intercept = 0;
+  double slope = 0;
+  int first_y = 0;
+  int last_y = 0;
+  float inlier_ratio = 0;
+  float rmse = 0;
+  float at(float y) const { return static_cast<float>(intercept + slope * y); }
+};
+
+bool leastSquaresLine(const std::vector<cv::Point2f>& points, LinearModel& line) {
+  if (points.size() < 2) return false;
+  double sum_y = 0, sum_x = 0, sum_yy = 0, sum_yx = 0;
+  for (const auto& p : points) {
+    sum_y += p.y;
+    sum_x += p.x;
+    sum_yy += static_cast<double>(p.y) * p.y;
+    sum_yx += static_cast<double>(p.y) * p.x;
+  }
+  const double n = static_cast<double>(points.size());
+  const double denominator = n * sum_yy - sum_y * sum_y;
+  if (std::abs(denominator) < 1e-6) return false;
+  line.slope = (n * sum_yx - sum_y * sum_x) / denominator;
+  line.intercept = (sum_x - line.slope * sum_y) / n;
+  return true;
+}
+
+bool robustLine(const std::vector<cv::Point2f>& points, float residual_limit,
+                float minimum_ratio, float minimum_span, LinearModel& line) {
+  if (!leastSquaresLine(points, line)) return false;
+  std::vector<cv::Point2f> inliers;
+  for (int iteration = 0; iteration < 3; ++iteration) {
+    inliers.clear();
+    for (const auto& p : points)
+      if (std::abs(p.x - line.at(p.y)) <= residual_limit) inliers.push_back(p);
+    if (inliers.size() < 2 || !leastSquaresLine(inliers, line)) return false;
+  }
+  line.first_y = static_cast<int>(inliers.front().y);
+  line.last_y = static_cast<int>(inliers.back().y);
+  line.inlier_ratio = static_cast<float>(inliers.size()) / points.size();
+  double squared = 0;
+  for (const auto& p : inliers) {
+    const double residual = p.x - line.at(p.y);
+    squared += residual * residual;
+  }
+  line.rmse = static_cast<float>(std::sqrt(squared / inliers.size()));
+  return line.inlier_ratio >= minimum_ratio &&
+         line.last_y - line.first_y >= minimum_span &&
+         line.rmse <= residual_limit * 0.75f;
+}
+
+struct EdgeCandidate {
+  float x = 0;
+  float score = 0;
+};
+
+struct CandidateRow {
+  int y = 0;
+  std::vector<EdgeCandidate> edges;
+};
+
+struct LineSupport {
+  std::vector<cv::Point2f> points;
+  int eligible_rows = 0;
+  float score = 0;
+  float squared_error = 0;
+};
+
+LineSupport supportForLine(const LinearModel& line,
+                           const std::vector<CandidateRow>& rows,
+                           const LinearModel& left, float minimum_width,
+                           float residual_limit, int image_width) {
+  LineSupport support;
+  for (const auto& row : rows) {
+    const float expected = line.at(static_cast<float>(row.y));
+    if (expected <= left.at(static_cast<float>(row.y)) + minimum_width ||
+        expected >= image_width - 13) continue;
+    ++support.eligible_rows;
+    const EdgeCandidate* best = nullptr;
+    float best_value = -std::numeric_limits<float>::infinity();
+    for (const auto& candidate : row.edges) {
+      const float distance = std::abs(candidate.x - expected);
+      if (distance > residual_limit) continue;
+      const float value = candidate.score - distance * 0.3f;
+      if (value > best_value) { best = &candidate; best_value = value; }
+    }
+    if (best) {
+      support.points.emplace_back(best->x, static_cast<float>(row.y));
+      support.score += best->score;
+      const float residual = best->x - expected;
+      support.squared_error += residual * residual;
+    }
+  }
+  return support;
+}
+
+bool supportIsEnough(const LineSupport& support, float minimum_ratio,
+                     float minimum_span, float residual_limit,
+                     float lookahead, LinearModel& line) {
+  if (support.points.size() < 5 || support.eligible_rows < 5) return false;
+  line.first_y = static_cast<int>(support.points.front().y);
+  line.last_y = static_cast<int>(support.points.back().y);
+  line.inlier_ratio = static_cast<float>(support.points.size()) / support.eligible_rows;
+  line.rmse = std::sqrt(support.squared_error / support.points.size());
+  const bool target_supported = std::any_of(support.points.begin(), support.points.end(),
+      [lookahead](const cv::Point2f& p) { return std::abs(p.y - lookahead) <= 18; });
+  return line.inlier_ratio >= minimum_ratio &&
+         line.last_y - line.first_y >= minimum_span && target_supported &&
+         line.rmse <= residual_limit * 0.8f;
+}
+
+}  // namespace
+
+Config loadConfig(const std::string& path) {
+  cv::FileStorage fs(path, cv::FileStorage::READ);
+  if (!fs.isOpened()) throw std::runtime_error("cannot open config: " + path);
+  Config c;
+  readValue(fs.root(), "input_width", c.input_width);
+  readValue(fs.root(), "input_height", c.input_height);
+  readValue(fs.root(), "process_width", c.process_width);
+  readValue(fs.root(), "process_height", c.process_height);
+  readValue(fs.root(), "equalize_value", c.equalize_value);
+  readValue(fs.root(), "color_distance_max", c.color_distance_max);
+  readValue(fs.root(), "color_background_ratio", c.color_background_ratio);
+  readValue(fs.root(), "chroma_row_ratio", c.chroma_row_ratio);
+  readValue(fs.root(), "chroma_min_contrast", c.chroma_min_contrast);
+  readValue(fs.root(), "edge_min_score", c.edge_min_score);
+  readValue(fs.root(), "edge_line_residual_px", c.edge_line_residual_px);
+  readValue(fs.root(), "edge_min_inlier_ratio", c.edge_min_inlier_ratio);
+  readValue(fs.root(), "edge_min_span_fraction", c.edge_min_span_fraction);
+  readValue(fs.root(), "morphology_pixels", c.morphology_pixels);
+  readValue(fs.root(), "max_white_gap_width_ratio", c.max_white_gap_width_ratio);
+  readValue(fs.root(), "min_road_width_fraction", c.min_road_width_fraction);
+  readValue(fs.root(), "max_road_width_fraction", c.max_road_width_fraction);
+  readValue(fs.root(), "junction_min_arm_widths", c.junction_min_arm_widths);
+  readValue(fs.root(), "junction_vote_frames", c.junction_vote_frames);
+  readValue(fs.root(), "junction_vote_window", c.junction_vote_window);
+  readValue(fs.root(), "lookahead_fraction", c.lookahead_fraction);
+  readValue(fs.root(), "minimum_confidence", c.minimum_confidence);
+  auto roi = fs["roi_fraction"];
+  if (!roi.empty()) {
+    if (roi.size() != 4) throw std::runtime_error("roi_fraction needs [x,y,w,h]");
+    c.roi_fraction = {static_cast<float>((double)roi[0]), static_cast<float>((double)roi[1]),
+                      static_cast<float>((double)roi[2]), static_cast<float>((double)roi[3])};
+  }
+  const auto hsv = fs["road_hsv"];
+  if (!hsv.empty()) {
+    if (hsv.size() != 6) throw std::runtime_error("road_hsv needs [h_min,h_max,s_min,s_max,v_min,v_max]");
+    c.road_hsv = {(int)hsv[0], (int)hsv[1], (int)hsv[2],
+                  (int)hsv[3], (int)hsv[4], (int)hsv[5]};
+  }
+  const auto src = fs["perspective_src"];
+  const auto dst = fs["perspective_dst"];
+  if (!src.empty() || !dst.empty()) {
+    if (src.empty() || dst.empty()) throw std::runtime_error("both perspective point sets are required");
+    c.perspective_src = readPoints(src);
+    c.perspective_dst = readPoints(dst);
+    c.use_perspective = true;
+  }
+  validateConfig(c);
+  return c;
+}
+
+void validateConfig(const Config& c) {
+  if (c.input_width <= 0 || c.input_height <= 0 || c.process_width < 80 ||
+      c.process_height < 60 || c.input_width * c.process_height != c.input_height * c.process_width)
+    throw std::runtime_error("input and process sizes must have the same aspect ratio");
+  if (c.roi_fraction.x < 0 || c.roi_fraction.y < 0 || c.roi_fraction.width <= 0 ||
+      c.roi_fraction.height <= 0 || c.roi_fraction.x + c.roi_fraction.width > 1 ||
+      c.roi_fraction.y + c.roi_fraction.height > 1)
+    throw std::runtime_error("invalid roi_fraction");
+  if (c.road_hsv.h_min < 0 || c.road_hsv.h_min > 179 ||
+      c.road_hsv.h_max < 0 || c.road_hsv.h_max > 179 || c.road_hsv.s_min < 0 ||
+      c.road_hsv.s_max > 255 || c.road_hsv.v_min < 0 || c.road_hsv.v_max > 255 ||
+      c.road_hsv.s_min > c.road_hsv.s_max || c.road_hsv.v_min > c.road_hsv.v_max)
+    throw std::runtime_error("invalid HSV range");
+  if (c.junction_vote_frames < 1 || c.junction_vote_window < c.junction_vote_frames ||
+      c.morphology_pixels < 1 || c.morphology_pixels > 31 ||
+      c.color_distance_max <= 0 || c.color_background_ratio <= 0 ||
+      c.chroma_row_ratio < 0 || c.chroma_row_ratio > 1 ||
+      c.chroma_min_contrast < 0 || c.edge_min_score <= 0 ||
+      c.edge_line_residual_px <= 0 || c.edge_min_inlier_ratio <= 0 ||
+      c.edge_min_inlier_ratio > 1 || c.edge_min_span_fraction <= 0 ||
+      c.edge_min_span_fraction > 1 ||
+      c.max_white_gap_width_ratio <= 0 || c.junction_min_arm_widths <= 0 ||
+      c.min_road_width_fraction <= 0 || c.max_road_width_fraction > 1 ||
+      c.min_road_width_fraction >= c.max_road_width_fraction ||
+      c.lookahead_fraction <= 0 || c.lookahead_fraction >= 1 ||
+      c.roi_fraction.y + c.roi_fraction.height < 0.8f ||
+      c.minimum_confidence < 0 || c.minimum_confidence > 1)
+    throw std::runtime_error("invalid detection parameter");
+  if (c.use_perspective) {
+    std::vector<cv::Point2f> src(c.perspective_src.begin(), c.perspective_src.end());
+    std::vector<cv::Point2f> dst(c.perspective_dst.begin(), c.perspective_dst.end());
+    if (std::abs(cv::contourArea(src)) < 100 || std::abs(cv::contourArea(dst)) < 100)
+      throw std::runtime_error("perspective quadrilateral has zero or tiny area");
+  }
+}
+
+const char* toString(RoadType type) {
+  switch (type) {
+    case RoadType::UNKNOWN: return "UNKNOWN";
+    case RoadType::STRAIGHT: return "STRAIGHT";
+    case RoadType::LEFT_TURN: return "LEFT_TURN";
+    case RoadType::RIGHT_TURN: return "RIGHT_TURN";
+    case RoadType::LEFT_BRANCH: return "LEFT_BRANCH";
+    case RoadType::RIGHT_BRANCH: return "RIGHT_BRANCH";
+    case RoadType::T_JUNCTION: return "T_JUNCTION";
+  }
+  return "UNKNOWN";
+}
+
+RoadDetector::RoadDetector(Config config) : config_(std::move(config)) {
+  validateConfig(config_);
+  vehicle_x_ = config_.process_width / 2.0f;
+  if (config_.use_perspective) {
+    std::vector<cv::Point2f> src(config_.perspective_src.begin(), config_.perspective_src.end());
+    std::vector<cv::Point2f> dst(config_.perspective_dst.begin(), config_.perspective_dst.end());
+    const float sx = static_cast<float>(config_.process_width) / config_.input_width;
+    const float sy = static_cast<float>(config_.process_height) / config_.input_height;
+    for (auto& p : src) { p.x *= sx; p.y *= sy; }
+    for (auto& p : dst) { p.x *= sx; p.y *= sy; }
+    warp_ = cv::getPerspectiveTransform(src, dst);
+    inverse_warp_ = warp_.inv();
+    std::vector<cv::Point2f> vehicle{{config_.process_width / 2.0f,
+                                      config_.process_height * 0.95f}}, projected;
+    cv::perspectiveTransform(vehicle, projected, warp_);
+    vehicle_x_ = projected.front().x;
+  }
+}
+
+cv::Mat RoadDetector::segment(const cv::Mat& bgr) const {
+  cv::Mat small, view, hsv;
+  cv::resize(bgr, small, cv::Size(config_.process_width, config_.process_height));
+  if (config_.use_perspective)
+    cv::warpPerspective(small, view, warp_, small.size(), cv::INTER_LINEAR,
+                        cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+  else view = small;
+  cv::cvtColor(view, hsv, cv::COLOR_BGR2HSV);
+  if (config_.equalize_value) {
+    std::vector<cv::Mat> channels;
+    cv::split(hsv, channels);
+    auto clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    clahe->apply(channels[2], channels[2]);
+    cv::merge(channels, hsv);
+  }
+  const int w = hsv.cols, h = hsv.rows;
+  // In a forward view the road can fill the bottom corners. Sample color from
+  // mid-range, where both road and outer surface are visible.
+  const cv::Rect road_seed(w * 44 / 100, h * 36 / 100, w * 12 / 100, h * 14 / 100);
+  const cv::Rect left_seed(w * 2 / 100, h * 36 / 100, w * 8 / 100, h * 14 / 100);
+  const cv::Rect right_seed(w * 90 / 100, h * 36 / 100, w * 8 / 100, h * 14 / 100);
+  const cv::Scalar road = medianHsv(hsv, road_seed);
+  const cv::Scalar left = medianHsv(hsv, left_seed);
+  const cv::Scalar right = medianHsv(hsv, right_seed);
+  cv::Mat smoothed;
+  cv::GaussianBlur(view, smoothed, cv::Size(15, 7), 0);
+  const cv::Rect roi(static_cast<int>(config_.roi_fraction.x * w),
+                     static_cast<int>(config_.roi_fraction.y * h),
+                     static_cast<int>(config_.roi_fraction.width * w),
+                     static_cast<int>(config_.roi_fraction.height * h));
+  cv::Mat candidates = cv::Mat::zeros(hsv.size(), CV_8UC1);
+  for (int y = roi.y; y < std::min(h, roi.y + roi.height); ++y) {
+    const auto* pixels = hsv.ptr<cv::Vec3b>(y);
+    const auto* colors = smoothed.ptr<cv::Vec3b>(y);
+    auto* row = candidates.ptr<uchar>(y);
+    const auto cool = [&](int x) { return static_cast<float>(colors[x][0]) - colors[x][2]; };
+    const float outer = std::min(cool(std::clamp(w / 16, 0, w - 1)),
+                                 cool(std::clamp(w * 15 / 16, 0, w - 1)));
+    float road_cool = -255.0f;
+    for (int x = w * 45 / 100; x < w * 55 / 100; x += 3)
+      road_cool = std::max(road_cool, cool(x));
+    const float cool_threshold = outer + config_.chroma_row_ratio * (road_cool - outer);
+    for (int x = roi.x; x < std::min(w, roi.x + roi.width); ++x) {
+      const cv::Vec3b p = pixels[x];
+      if (!withinHsv(p, config_.road_hsv)) continue;
+      const float dr = hsvDistance(p, road);
+      const float db = std::min(hsvDistance(p, left), hsvDistance(p, right));
+      const bool hsv_match = dr <= config_.color_distance_max &&
+                             dr <= db * config_.color_background_ratio;
+      const bool chroma_match = road_cool > outer + config_.chroma_min_contrast &&
+                                cool(x) >= cool_threshold;
+      if (hsv_match || chroma_match)
+        row[x] = 255;
+    }
+  }
+  const int k = config_.morphology_pixels | 1;
+  cv::morphologyEx(candidates, candidates, cv::MORPH_OPEN,
+                   cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k, k)));
+  // The vertical close bridges only short horizontal white bars.
+  int estimated_width = std::max(20, w / 3);
+  const int sample_y = h * 85 / 100;
+  if (candidates.at<uchar>(sample_y, w / 2)) {
+    int left_x = w / 2, right_x = w / 2;
+    while (left_x > 0 && candidates.at<uchar>(sample_y, left_x - 1)) --left_x;
+    while (right_x < w - 1 && candidates.at<uchar>(sample_y, right_x + 1)) ++right_x;
+    const int observed_width = right_x - left_x + 1;
+    if (observed_width >= config_.min_road_width_fraction * w &&
+        observed_width <= config_.max_road_width_fraction * w)
+      estimated_width = observed_width;
+  }
+  int gap = static_cast<int>(estimated_width * config_.max_white_gap_width_ratio);
+  gap = std::max(3, std::min(gap | 1, h / 5));
+  cv::morphologyEx(candidates, candidates, cv::MORPH_CLOSE,
+                   cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, gap)));
+  return keepBottomConnected(candidates);
+}
+
+RoadResult RoadDetector::process(const cv::Mat& bgr, std::int64_t timestamp_ms) {
+  if (bgr.empty() || bgr.type() != CV_8UC3 || bgr.cols != config_.input_width ||
+      bgr.rows != config_.input_height)
+    throw std::invalid_argument("expected 1280x720 CV_8UC3 BGR frame (or configured input size)");
+  const float previous_center = previous_center_x_;
+  RoadResult result = analyzeMask(segment(bgr), timestamp_ms);
+  cv::Mat processed, view;
+  cv::resize(bgr, processed, cv::Size(config_.process_width, config_.process_height));
+  if (config_.use_perspective)
+    cv::warpPerspective(processed, view, warp_, processed.size(), cv::INTER_LINEAR,
+                        cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+  else view = processed;
+  if (result.type == RoadType::STRAIGHT || result.type == RoadType::UNKNOWN) {
+    if (!refineWithEdges(view, result)) {
+      previous_center_x_ = previous_center;
+      result.valid = false;
+      result.type = RoadType::UNKNOWN;
+      result.available_directions = 0;
+      result.confidence = 0;
+      result.lateral_error = 0;
+      result.heading_error_rad = 0;
+      result.left_boundary.clear();
+      result.right_boundary.clear();
+      result.centerline.clear();
+    }
+  }
+  return result;
+}
+
+RoadResult RoadDetector::processMask(const cv::Mat& mask, std::int64_t timestamp_ms) {
+  if (mask.empty() || mask.type() != CV_8UC1 || mask.cols != config_.process_width ||
+      mask.rows != config_.process_height)
+    throw std::invalid_argument("mask size/type does not match configured processing size");
+  return analyzeMask(keepBottomConnected(mask), timestamp_ms);
+}
+
+RoadType RoadDetector::stabilize(RoadType current) {
+  recent_types_.push_back(current);
+  if (static_cast<int>(recent_types_.size()) > config_.junction_vote_window)
+    recent_types_.erase(recent_types_.begin());
+  if (current == RoadType::UNKNOWN) return RoadType::UNKNOWN;
+  if (current == RoadType::STRAIGHT) return RoadType::STRAIGHT;
+  const int count = static_cast<int>(std::count(recent_types_.begin(), recent_types_.end(), current));
+  return count >= config_.junction_vote_frames ? current : RoadType::UNKNOWN;
+}
+
+cv::Point2f RoadDetector::sourcePoint(const cv::Point2f& processed) const {
+  cv::Point2f point = processed;
+  if (config_.use_perspective) {
+    std::vector<cv::Point2f> in{point}, out;
+    cv::perspectiveTransform(in, out, inverse_warp_);
+    point = out.front();
+  }
+  point.x *= static_cast<float>(config_.input_width) / config_.process_width;
+  point.y *= static_cast<float>(config_.input_height) / config_.process_height;
+  return point;
+}
+
+bool RoadDetector::refineWithEdges(const cv::Mat& image, RoadResult& result) {
+  cv::Mat smooth;
+  cv::GaussianBlur(image, smooth, cv::Size(21, 7), 0);
+  cv::Mat hsv;
+  cv::cvtColor(smooth, hsv, cv::COLOR_BGR2HSV);
+  const int w = image.cols, h = image.rows;
+  const cv::Scalar road_model = medianHsv(hsv, cv::Rect(w * 44 / 100, h * 36 / 100,
+                                                       w * 12 / 100, h * 14 / 100));
+  const int first_y = std::max(static_cast<int>(h * 0.17f),
+                               static_cast<int>(config_.roi_fraction.y * h) + 5);
+  const int last_y = std::min(h - 15, static_cast<int>(
+      (config_.roi_fraction.y + config_.roi_fraction.height) * h) - 5);
+  const auto edgeScore = [&](int y, int x, int side) -> float {
+    const cv::Vec3b a = smooth.at<cv::Vec3b>(y, x - 12);
+    const cv::Vec3b b = smooth.at<cv::Vec3b>(y, x + 12);
+    const float cool_a = static_cast<float>(a[0]) - a[2];
+    const float cool_b = static_cast<float>(b[0]) - b[2];
+    const float light_a = (static_cast<float>(a[0]) + a[1] + a[2]) / 3.0f;
+    const float light_b = (static_cast<float>(b[0]) + b[1] + b[2]) / 3.0f;
+    const float chroma_transition = side == 0 ? cool_b - cool_a : cool_a - cool_b;
+    float score = chroma_transition + 0.1f * std::abs(light_b - light_a);
+    if (side == 1) {
+      const cv::Vec3b inner = hsv.at<cv::Vec3b>(y, x - 12);
+      const cv::Vec3b outer = hsv.at<cv::Vec3b>(y, x + 12);
+      if (!withinHsv(inner, config_.road_hsv)) return -1000.0f;
+      score += std::clamp(0.12f * (hsvDistance(outer, road_model) -
+                                    hsvDistance(inner, road_model)), -2.0f, 2.0f);
+    }
+    return score;
+  };
+  std::vector<cv::Point2f> left_points;
+  float position = -1, velocity = 0;
+  int misses = 0;
+  for (int y = first_y; y <= last_y; y += 6) {
+    int x0, x1;
+    if (position < 0) {
+      x0 = static_cast<int>(w * 0.10f);
+      x1 = static_cast<int>(w * 0.45f);
+    } else {
+      const int predicted = static_cast<int>(std::round(position + velocity));
+      const int radius = 17 + std::min(misses, 2) * 8;
+      x0 = predicted - radius;
+      x1 = predicted + radius;
+    }
+    x0 = std::clamp(x0, 13, w - 14);
+    x1 = std::clamp(x1, 13, w - 14);
+    float best = -std::numeric_limits<float>::infinity();
+    int best_x = -1;
+    for (int x = x0; x <= x1; ++x) {
+      const float displacement = position < 0 ? 0 : x - (position + velocity);
+      const float score = edgeScore(y, x, 0) - 0.018f * displacement * displacement;
+      if (score > best) { best = score; best_x = x; }
+    }
+    if (best_x < 0 || edgeScore(y, best_x, 0) < config_.edge_min_score) {
+      ++misses;
+      continue;
+    }
+    if (position >= 0)
+      velocity = std::clamp(0.6f * velocity + 0.4f * (best_x - position), -12.0f, 12.0f);
+    position = static_cast<float>(best_x);
+    misses = 0;
+    left_points.emplace_back(position, static_cast<float>(y));
+  }
+  const float minimum_span = config_.edge_min_span_fraction * h;
+  LinearModel left;
+  if (!robustLine(left_points, config_.edge_line_residual_px,
+                  config_.edge_min_inlier_ratio, minimum_span, left)) return false;
+
+  std::vector<CandidateRow> rows;
+  for (int y = first_y; y <= last_y; y += 6) {
+    CandidateRow row;
+    row.y = y;
+    const int x0 = std::max({13, static_cast<int>(w * 0.45f),
+                             static_cast<int>(left.at(y) +
+                                              config_.min_road_width_fraction * w)});
+    for (int x = x0 + 3; x < w - 17; ++x) {
+      const float score = edgeScore(y, x, 1);
+      if (score < config_.edge_min_score || score < edgeScore(y, x - 3, 1) ||
+          score < edgeScore(y, x + 3, 1)) continue;
+      row.edges.push_back({static_cast<float>(x), score});
+    }
+    std::sort(row.edges.begin(), row.edges.end(),
+              [](const EdgeCandidate& a, const EdgeCandidate& b) { return a.score > b.score; });
+    std::vector<EdgeCandidate> distinct;
+    for (const auto& candidate : row.edges) {
+      const bool separated = std::all_of(distinct.begin(), distinct.end(),
+          [&candidate](const EdgeCandidate& accepted) {
+            return std::abs(candidate.x - accepted.x) >= 8;
+          });
+      if (separated) distinct.push_back(candidate);
+      if (distinct.size() == 5) break;
+    }
+    row.edges = std::move(distinct);
+    rows.push_back(std::move(row));
+  }
+
+  const float target_y = config_.lookahead_fraction * h;
+  LinearModel best_right;
+  float best_value = -std::numeric_limits<float>::infinity();
+  const float min_width = config_.min_road_width_fraction * w;
+  for (std::size_t i = 0; i < rows.size(); i += 2) {
+    for (std::size_t j = i + 1; j < rows.size(); j += 2) {
+      const int dy = rows[j].y - rows[i].y;
+      if (dy < minimum_span) continue;
+      for (const auto& first : rows[i].edges) {
+        for (const auto& last : rows[j].edges) {
+          LinearModel hypothesis;
+          hypothesis.slope = (last.x - first.x) / dy;
+          hypothesis.intercept = first.x - hypothesis.slope * rows[i].y;
+          if (!config_.use_perspective && hypothesis.slope - left.slope < -0.08)
+            continue;
+          const float width = hypothesis.at(target_y) - left.at(target_y);
+          if (width < min_width || width > config_.max_road_width_fraction * w)
+            continue;
+          const auto support = supportForLine(hypothesis, rows, left, min_width,
+                                              config_.edge_line_residual_px, w);
+          if (!supportIsEnough(support, config_.edge_min_inlier_ratio, minimum_span,
+                               config_.edge_line_residual_px, target_y, hypothesis)) continue;
+          const float value = support.points.size() * 100.0f + support.score * 0.2f -
+                              support.squared_error * 0.15f;
+          if (value > best_value) { best_value = value; best_right = hypothesis; }
+        }
+      }
+    }
+  }
+  if (!std::isfinite(best_value)) return false;
+  LinearModel right = best_right;
+  for (int iteration = 0; iteration < 3; ++iteration) {
+    const auto support = supportForLine(right, rows, left, min_width,
+                                        config_.edge_line_residual_px, w);
+    if (!supportIsEnough(support, config_.edge_min_inlier_ratio, minimum_span,
+                         config_.edge_line_residual_px, target_y, right) ||
+        !leastSquaresLine(support.points, right)) return false;
+  }
+  const auto final_support = supportForLine(right, rows, left, min_width,
+                                             config_.edge_line_residual_px, w);
+  if (!supportIsEnough(final_support, config_.edge_min_inlier_ratio, minimum_span,
+                       config_.edge_line_residual_px, target_y, right)) return false;
+  if (!config_.use_perspective && right.slope - left.slope < -0.08) return false;
+  const float width = right.at(target_y) - left.at(target_y);
+  if (width < min_width || width > config_.max_road_width_fraction * w) return false;
+  const int first_observed = std::max(left.first_y, right.first_y);
+  const int last_observed = std::min(left.last_y, right.last_y);
+  if (last_observed - first_observed < minimum_span || target_y < first_observed ||
+      target_y > last_observed) return false;
+  const float center = (left.at(target_y) + right.at(target_y)) / 2.0f;
+  const float near = (left.at(target_y + 20) + right.at(target_y + 20)) / 2.0f;
+  const float far = (left.at(target_y - 20) + right.at(target_y - 20)) / 2.0f;
+  result.left_boundary.clear();
+  result.right_boundary.clear();
+  result.centerline.clear();
+  for (int y = first_observed; y <= last_observed; y += 6) {
+    const float l = left.at(static_cast<float>(y));
+    const float r = right.at(static_cast<float>(y));
+    if (l < 0 || r >= w || l >= r) continue;
+    result.left_boundary.push_back(sourcePoint({l, static_cast<float>(y)}));
+    result.right_boundary.push_back(sourcePoint({r, static_cast<float>(y)}));
+    result.centerline.push_back(sourcePoint({(l + r) / 2, static_cast<float>(y)}));
+  }
+  if (result.centerline.empty()) return false;
+  result.lateral_error = (center - vehicle_x_) / (width / 2.0f);
+  result.heading_error_rad = std::atan2(far - near, 40.0f);
+  const float line_quality = 1.0f - std::clamp((left.rmse + right.rmse) /
+      (2.0f * config_.edge_line_residual_px), 0.0f, 1.0f);
+  result.confidence = std::clamp(0.35f * left.inlier_ratio +
+      0.40f * right.inlier_ratio + 0.15f *
+      ((last_observed - first_observed) / static_cast<float>(h)) +
+      0.10f * line_quality, 0.0f, 1.0f);
+  if (result.confidence < config_.minimum_confidence) return false;
+  result.valid = true;
+  previous_center_x_ = center;
+  return true;
+}
+
+RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp_ms) {
+  RoadResult result;
+  result.timestamp_ms = timestamp_ms;
+  result.road_mask = mask.clone();
+  const int w = mask.cols, h = mask.rows;
+  std::vector<cv::Point2f> left, right;
+  std::vector<float> widths;
+  float predicted = previous_center_x_ < 0 ? vehicle_x_ : previous_center_x_;
+  const int y_top = std::max(1, static_cast<int>(config_.roi_fraction.y * h));
+  const int y_bottom = std::min(h - 2, static_cast<int>((config_.roi_fraction.y +
+                                                         config_.roi_fraction.height) * h) - 1);
+  int examined = 0;
+  for (int y = y_bottom; y >= y_top; y -= 6) {
+    ++examined;
+    const auto* pixels = mask.ptr<uchar>(y);
+    int seed = std::clamp(static_cast<int>(predicted), 0, w - 1);
+    if (!pixels[seed]) {
+      int nearest = -1;
+      for (int distance = 1; distance < w / 3; ++distance) {
+        if (seed - distance >= 0 && pixels[seed - distance]) { nearest = seed - distance; break; }
+        if (seed + distance < w && pixels[seed + distance]) { nearest = seed + distance; break; }
+      }
+      if (nearest < 0) continue;
+      seed = nearest;
+    }
+    int x0 = seed, x1 = seed;
+    while (x0 > 0 && pixels[x0 - 1]) --x0;
+    while (x1 < w - 1 && pixels[x1 + 1]) ++x1;
+    const float width = static_cast<float>(x1 - x0 + 1);
+    predicted = (x0 + x1) / 2.0f;
+    if (width < config_.min_road_width_fraction * w ||
+        width > config_.max_road_width_fraction * w) continue;
+    left.emplace_back(static_cast<float>(x0), static_cast<float>(y));
+    right.emplace_back(static_cast<float>(x1), static_cast<float>(y));
+    widths.push_back(width);
+  }
+  if (widths.size() < 5) {
+    stabilize(RoadType::UNKNOWN);
+    return result;
+  }
+  std::vector<float> sorted_widths = widths;
+  std::nth_element(sorted_widths.begin(), sorted_widths.begin() + sorted_widths.size() / 2,
+                   sorted_widths.end());
+  const float median_width = sorted_widths[sorted_widths.size() / 2];
+  std::vector<cv::Point2f> left_fit, right_fit;
+  for (std::size_t i = 0; i < widths.size(); ++i) {
+    if (widths[i] >= median_width * 0.55f && widths[i] <= median_width * 1.45f) {
+      left_fit.push_back(left[i]);
+      right_fit.push_back(right[i]);
+    }
+  }
+  cv::Vec3d lc, rc;
+  if (!fitQuadratic(left_fit, lc) || !fitQuadratic(right_fit, rc)) {
+    stabilize(RoadType::UNKNOWN);
+    return result;
+  }
+  const float look_y = h * config_.lookahead_fraction;
+  const float center_x = (eval(lc, look_y) + eval(rc, look_y)) / 2.0f;
+  const float near_x = (eval(lc, look_y + 20) + eval(rc, look_y + 20)) / 2.0f;
+  const float far_x = (eval(lc, look_y - 20) + eval(rc, look_y - 20)) / 2.0f;
+  const float fitted_width = eval(rc, look_y) - eval(lc, look_y);
+  if (!std::isfinite(center_x) || fitted_width < config_.min_road_width_fraction * w ||
+      fitted_width > config_.max_road_width_fraction * w) {
+    stabilize(RoadType::UNKNOWN);
+    return result;
+  }
+  int consistent = 0;
+  for (float width : widths)
+    if (std::abs(width - median_width) < median_width * 0.35f) ++consistent;
+  const float coverage = static_cast<float>(widths.size()) / std::max(1, examined);
+  const float consistency = static_cast<float>(consistent) / widths.size();
+  result.confidence = std::clamp(0.65f * coverage + 0.35f * consistency, 0.0f, 1.0f);
+  if (result.confidence < config_.minimum_confidence) {
+    stabilize(RoadType::UNKNOWN);
+    return result;
+  }
+  result.valid = true;
+  result.lateral_error = (center_x - vehicle_x_) / std::max(1.0f, fitted_width / 2.0f);
+  result.heading_error_rad = std::atan2(far_x - near_x, 40.0f);
+  previous_center_x_ = center_x;
+  for (int y = y_bottom; y >= y_top; y -= 6) {
+    const float l = eval(lc, static_cast<float>(y));
+    const float r = eval(rc, static_cast<float>(y));
+    if (l < 0 || r >= w || l >= r) continue;
+    result.left_boundary.push_back(sourcePoint({l, static_cast<float>(y)}));
+    result.right_boundary.push_back(sourcePoint({r, static_cast<float>(y)}));
+    result.centerline.push_back(sourcePoint({(l + r) / 2, static_cast<float>(y)}));
+  }
+  const Topology topology = topologyFromMask(mask, median_width, config_);
+  result.type = stabilize(topology.type);
+  if (result.type == topology.type) result.available_directions = topology.directions;
+  return result;
+}
+
+}  // namespace road_finder
