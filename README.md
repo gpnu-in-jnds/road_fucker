@@ -19,13 +19,24 @@ ctest --test-dir build --output-on-failure
 
 ```sh
 ./build/road_finder --source 0 --config config/road_finder.yaml
-./build/road_finder --source recording.mp4 --display
+./build/road_finder --source 0 --display --no-json
+./build/road_finder --source recording.mp4 --display --no-json
+./build/road_finder --source frame.png --display --no-json
 ./build/road_finder --source frame.png --overlay /tmp/overlay.png --mask /tmp/mask.png
 ```
 
 `--source` 接受摄像头序号、视频文件、图片，或以 `appsink` 结束的 GStreamer 管道。
 对摄像头序号会请求 1280×720；实际帧、视频文件及图片均须为此尺寸，否则明确报错。
-`--overlay`、`--mask` 只用于单张图片。按 Esc 退出视频预览。
+`--overlay`、`--mask` 只用于单张图片。视频预览逐帧显示最终拟合的左边线
+（青色）、右边线（橙色）和中线（绿色），以及当前路况、置信度和实际显示帧率。
+预览窗口按 1280×720 画面尺寸打开，并保持原始宽高比；仍可手动调整窗口大小。
+`--no-json` 可在预览时关闭终端中的逐帧 JSON 输出，不影响画面和检测结果。
+路况标签包括 `STRAIGHT`、`LEFT TURN`、`RIGHT TURN`、`LEFT BRANCH`、
+`RIGHT BRANCH`、`T JUNCTION`、`UNKNOWN` 和 `LOST`；`LOST` 表示本帧没有
+有效的循迹几何结果，并不表示道路终止。FPS 统计完整的读取、处理、输出与显示循环，
+每秒更新一次，开始时显示 `MEASURING`，不是视频文件声明的帧率。
+按 Esc 或 Q、关闭窗口、或播放到文件末尾时结束预览。`--display` 需要图形桌面环境；
+无显示器时不加该参数仍可逐帧输出 JSON。
 
 每帧在 stdout 输出一行 JSON，处理耗时和错误写入 stderr。字段包含
 `timestamp_ms`、`valid`、`type`、`directions`、`confidence`、
