@@ -1,4 +1,4 @@
-#include "road_finder/preview_window.hpp"
+#include "road_finder/preview.hpp"
 
 #include <cmath>
 #include <iostream>

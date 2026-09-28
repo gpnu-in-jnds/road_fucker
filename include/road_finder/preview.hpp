@@ -1,6 +1,12 @@
 #pragma once
 
+#include "road_finder/road_detector.hpp"
+
+#include <opencv2/core.hpp>
+
+#include <chrono>
 #include <cmath>
+#include <string>
 
 namespace road_finder {
 
@@ -52,6 +58,34 @@ class PreviewWindowState {
   bool visible_seen_ = false;
   bool closed_ = false;
   int unusable_readings_ = 0;
+};
+
+// Draws the boundaries, the centerline and the road-condition panel, without the
+// frame-rate line. Used for the single-frame preview and for --overlay exports.
+cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result);
+
+// Owns the preview window: creation, drawing, event loop and close detection.
+class Preview {
+ public:
+  // Throws when the window cannot be created (no display, no GUI backend).
+  explicit Preview(cv::Size image_size);
+
+  // Draws one frame and pumps the GUI event loop. wait_ms is passed to
+  // cv::waitKey: 1 while streaming, 0 to block on a single image. Returns false
+  // when the preview must stop; stopReason() then explains why.
+  bool show(const cv::Mat& frame, const RoadResult& result, int wait_ms = 1);
+
+  const std::string& stopReason() const { return stop_reason_; }
+
+ private:
+  void frameCompleted();
+
+  PreviewWindowState state_;
+  bool unusable_visibility_reported_ = false;
+  std::string stop_reason_;
+  std::chrono::steady_clock::time_point fps_window_start_ = std::chrono::steady_clock::now();
+  int fps_frames_ = 0;
+  double fps_ = -1.0;
 };
 
 }  // namespace road_finder
