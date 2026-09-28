@@ -1,11 +1,22 @@
 %YAML:1.0
 ---
+# Original frame size: the camera or image must match it. Both the detection
+# window below and the perspective points use this coordinate system.
 input_width: 1280
 input_height: 720
+
+# Processing width only; the height follows the input aspect ratio (640 -> 360).
+# Every pixel-unit threshold (edge_line_residual_px, morphology_pixels, ...) is
+# measured on this processed image.
 process_width: 640
-process_height: 360
-# Fractions of the processing image, after optional perspective warp.
-roi_fraction: [0.02, 0.12, 0.96, 0.85]
+
+# Detection window: pixel rectangle [x, y, width, height] on the original frame.
+# Read the numbers straight off the preview or an --overlay export: the window is
+# drawn there as a thin yellow outline. It has to reach at least 80% of the image
+# height, because the road profile grows from the bottom of the window.
+# default for reference
+# roi: [26, 86, 1229, 612]
+roi: [0, 360, 1280, 360]
 
 # OpenCV HSV: H 0..179, S/V 0..255. Calibrate these from live video.
 # The broad defaults admit grey road pixels while the adaptive road/background

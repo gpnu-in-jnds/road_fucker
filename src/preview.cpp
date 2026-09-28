@@ -44,6 +44,15 @@ cv::Mat draw(const cv::Mat& frame, const RoadResult& result, bool show_fps, doub
     cv::putText(output, "FPS: " + label, {24, 109},
                 cv::FONT_HERSHEY_SIMPLEX, 0.7, white, 2, cv::LINE_AA);
   }
+  // Detection window actually used for this frame, in input-image pixels.
+  if (result.roi_polygon.size() == 4) {
+    std::vector<cv::Point> window;
+    window.reserve(result.roi_polygon.size());
+    for (const cv::Point2f& point : result.roi_polygon)
+      window.emplace_back(cvRound(point.x), cvRound(point.y));
+    cv::polylines(output, std::vector<std::vector<cv::Point>>{window}, /*isClosed=*/true,
+                  cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+  }
   const auto draw_line = [&](const std::vector<cv::Point2f>& points, const cv::Scalar& color) {
     for (std::size_t i = 1; i < points.size(); ++i)
       cv::line(output, points[i - 1], points[i], color, 3, cv::LINE_AA);

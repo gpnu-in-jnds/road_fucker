@@ -3,6 +3,7 @@
 #include <opencv2/core.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -30,9 +31,14 @@ struct HsvRange {
 struct Config {
   int input_width = 1280;
   int input_height = 720;
+  // Processing resolution: only the width is configured, the height follows the
+  // input aspect ratio so the two can never disagree. Pixel-unit thresholds
+  // (edge_line_residual_px, morphology_pixels, ...) use this processed image.
   int process_width = 640;
-  int process_height = 360;
-  cv::Rect2f roi_fraction{0.02f, 0.12f, 0.96f, 0.85f};
+  // Detection window in original input-image pixels [x, y, width, height]; the
+  // same coordinate system as the preview, --overlay exports and the
+  // perspective points. Converted to the processed (and warped) image internally.
+  cv::Rect roi{26, 86, 1229, 612};
   std::array<cv::Point2f, 4> perspective_src{};
   std::array<cv::Point2f, 4> perspective_dst{};
   bool use_perspective = false;
@@ -55,6 +61,11 @@ struct Config {
   int junction_vote_window = 5;
   float lookahead_fraction = 0.55f;
   float minimum_confidence = 0.38f;
+
+  int processHeight() const {
+    return static_cast<int>(std::lround(static_cast<double>(input_height) * process_width /
+                                        input_width));
+  }
 };
 
 Config loadConfig(const std::string& path);
@@ -72,6 +83,9 @@ struct RoadResult {
   std::vector<cv::Point2f> right_boundary;
   std::vector<cv::Point2f> centerline;
   cv::Mat road_mask;  // Optional debug image, at process resolution.
+  // Detection window actually used for this frame, as four corners in input-image
+  // pixels. Drawn by the preview and by --overlay exports. Not part of the JSON.
+  std::vector<cv::Point2f> roi_polygon;
 };
 
 const char* toString(RoadType type);
@@ -83,11 +97,17 @@ class RoadDetector {
   // Public for repeatable tests and camera-specific segmenters. Mask must be
   // CV_8UC1 at the configured processing size, with road pixels nonzero.
   RoadResult processMask(const cv::Mat& road_mask, std::int64_t timestamp_ms);
+  // Detection window in processed (and, with perspective, warped) pixels.
+  const cv::Rect& processRoi() const { return roi_processed_; }
+  // Detection window corners in input-image pixels, for debug drawing.
+  const std::vector<cv::Point2f>& roiPolygon() const { return roi_polygon_; }
 
  private:
   Config config_;
   cv::Mat warp_;
   cv::Mat inverse_warp_;
+  cv::Rect roi_processed_;
+  std::vector<cv::Point2f> roi_polygon_;
   std::vector<RoadType> recent_types_;
   float previous_center_x_ = -1.0f;
   float vehicle_x_ = -1.0f;

@@ -48,6 +48,7 @@ ctest --test-dir build --output-on-failure
 `--overlay`、`--mask` 只用于单张图片。视频预览逐帧显示最终拟合的左边线
 （青色）、右边线（橙色）和中线（绿色），以及当前路况、置信度和实际显示帧率。
 预览窗口按 1280×720 画面尺寸打开，并保持原始宽高比；仍可手动调整窗口大小。
+画面上的黄色细框是当前生效的检测窗口，含义与调法见[配置与现场标定](#配置与现场标定)。
 路况标签包括 `STRAIGHT`、`LEFT TURN`、`RIGHT TURN`、`LEFT BRANCH`、
 `RIGHT BRANCH`、`T JUNCTION`、`UNKNOWN` 和 `LOST`；`LOST` 表示本帧没有
 有效的循迹几何结果，并不表示道路终止。FPS 统计完整的读取、处理、输出与显示循环，
@@ -97,12 +98,33 @@ G_MESSAGES_DEBUG=all ./build/road_finder --no-display 2>&1 | tee /tmp/road_finde
 与 `xdg-desktop-portal-gtk`，或直接在 XFCE 会话内的终端启动程序，使
 `DBUS_SESSION_BUS_ADDRESS` 存在。无显示器的 `--no-display` 运行不受影响。
 
-## 现场标定
+## 配置与现场标定
+
+[配置文件](config/road_finder.yaml) 里只有两个几何参数决定“看哪里、看多大”：
+
+- `process_width`：处理分辨率**只写宽度**，高度按输入画面宽高比自动推导（`640` → 640×360），
+  因此不会出现输入/处理宽高比不一致这种错误。所有像素单位的阈值
+  （`edge_line_residual_px`、`morphology_pixels` 等）都以这张处理图为单位。
+- `roi: [x, y, 宽, 高]`：检测窗口，单位是**原始画面像素**，与预览画面、`--overlay` 导出图、
+  `perspective_src/perspective_dst` 使用同一坐标系；对着画面量出道路的大致范围直接填即可。
+  窗口必须延伸到画面底部附近（≥80% 高度），因为道路轮廓是从窗口底部向上生长的。
+
+不用靠心算确认：启动时 stderr 会打印一行解析结果，例如
+
+```
+geometry: input 1280x720, process 640x360, roi [26,86,1229,612] input px -> [13,43,614,306] process px
+```
+
+并且预览窗口与 `--overlay` 导出图上会用**黄色细框**画出实际生效的检测窗口；开启透视时，
+框是“透视图中实际窗口”反变换回原始画面的形状。旧的 `process_height` 与 `roi_fraction`
+已移除，配置文件里若还有这两个键，程序会直接报错并给出等价写法，例如
+`roi_fraction: [0.02, 0.12, 0.96, 0.85]` → `roi: [26, 86, 1229, 612]`
+（换算：`像素 = round(比例 × 输入宽/高)`）。
 
 默认参数只是起点。先固定相机，把各类道路和不同光照下的画面保存成 1280×720 的 PNG
 （用外部截图/抓帧工具即可），再用图片模式导出掩码和叠加图（见 `--overlay`、`--mask`），
-据此调整 [配置文件](config/road_finder.yaml) 中的 ROI、HSV 范围、道路宽度和分支阈值。样图中的灰色道路与背景都偏低饱和度，因此算法还用逐行色差和
-边缘约束，不能仅凭一组 HSV 阈值保证所有光照下的效果。
+据此调整检测窗口、HSV 范围、道路宽度和分支阈值。样图中的灰色道路与背景都偏低饱和度，
+因此算法还用逐行色差和边缘约束，不能仅凭一组 HSV 阈值保证所有光照下的效果。
 
 直道边线采用跨行稳健直线拟合。`edge_line_residual_px`、`edge_min_inlier_ratio` 和
 `edge_min_span_fraction` 控制离群点容忍度、最少支持比例和纵向覆盖；像素阈值以

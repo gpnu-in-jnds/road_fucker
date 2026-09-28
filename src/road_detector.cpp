@@ -32,6 +32,36 @@ std::array<cv::Point2f, 4> readPoints(const cv::FileNode& node) {
   return points;
 }
 
+// Legacy roi_fraction values are fractions of the processed image; the aspect
+// ratio matches the input image, so the fractions carry over to input pixels.
+cv::Rect roiFromFraction(const cv::FileNode& node, int input_width, int input_height) {
+  if (node.size() != 4) throw std::runtime_error("roi_fraction needs [x,y,w,h]");
+  const auto pixels = [](double fraction, int size) {
+    return static_cast<int>(std::lround(fraction * size));
+  };
+  return {pixels(static_cast<double>(node[0]), input_width),
+          pixels(static_cast<double>(node[1]), input_height),
+          pixels(static_cast<double>(node[2]), input_width),
+          pixels(static_cast<double>(node[3]), input_height)};
+}
+
+// Deprecated keys are rejected with the replacement value in the message, so
+// migrating a tuned configuration is a copy-paste.
+void rejectDeprecatedKeys(const cv::FileNode& root, const Config& c) {
+  if (!root["process_height"].empty())
+    throw std::runtime_error(
+        "process_height is no longer used: the processing height follows the input aspect "
+        "ratio, remove the key (process_width " + std::to_string(c.process_width) + " -> " +
+        std::to_string(c.processHeight()) + ")");
+  if (!root["roi_fraction"].empty()) {
+    const cv::Rect roi = roiFromFraction(root["roi_fraction"], c.input_width, c.input_height);
+    throw std::runtime_error(
+        "roi_fraction was replaced by roi in input-image pixels; use roi: [" +
+        std::to_string(roi.x) + ", " + std::to_string(roi.y) + ", " +
+        std::to_string(roi.width) + ", " + std::to_string(roi.height) + "]");
+  }
+}
+
 cv::Scalar medianHsv(const cv::Mat& hsv, cv::Rect rect) {
   rect &= cv::Rect(0, 0, hsv.cols, hsv.rows);
   if (rect.empty()) return cv::Scalar(0, 0, 0);
@@ -404,7 +434,6 @@ Config loadConfig(const std::string& path) {
   readValue(fs.root(), "input_width", c.input_width);
   readValue(fs.root(), "input_height", c.input_height);
   readValue(fs.root(), "process_width", c.process_width);
-  readValue(fs.root(), "process_height", c.process_height);
   readValue(fs.root(), "equalize_value", c.equalize_value);
   readValue(fs.root(), "color_distance_max", c.color_distance_max);
   readValue(fs.root(), "color_background_ratio", c.color_background_ratio);
@@ -423,11 +452,12 @@ Config loadConfig(const std::string& path) {
   readValue(fs.root(), "junction_vote_window", c.junction_vote_window);
   readValue(fs.root(), "lookahead_fraction", c.lookahead_fraction);
   readValue(fs.root(), "minimum_confidence", c.minimum_confidence);
-  auto roi = fs["roi_fraction"];
+  const auto roi = fs["roi"];
   if (!roi.empty()) {
-    if (roi.size() != 4) throw std::runtime_error("roi_fraction needs [x,y,w,h]");
-    c.roi_fraction = {static_cast<float>((double)roi[0]), static_cast<float>((double)roi[1]),
-                      static_cast<float>((double)roi[2]), static_cast<float>((double)roi[3])};
+    if (roi.size() != 4)
+      throw std::runtime_error("roi needs [x, y, width, height] in input-image pixels");
+    c.roi = cv::Rect(static_cast<int>(roi[0]), static_cast<int>(roi[1]),
+                     static_cast<int>(roi[2]), static_cast<int>(roi[3]));
   }
   const auto hsv = fs["road_hsv"];
   if (!hsv.empty()) {
@@ -444,17 +474,28 @@ Config loadConfig(const std::string& path) {
     c.use_perspective = true;
   }
   validateConfig(c);
+  rejectDeprecatedKeys(fs.root(), c);
   return c;
 }
 
 void validateConfig(const Config& c) {
-  if (c.input_width <= 0 || c.input_height <= 0 || c.process_width < 80 ||
-      c.process_height < 60 || c.input_width * c.process_height != c.input_height * c.process_width)
-    throw std::runtime_error("input and process sizes must have the same aspect ratio");
-  if (c.roi_fraction.x < 0 || c.roi_fraction.y < 0 || c.roi_fraction.width <= 0 ||
-      c.roi_fraction.height <= 0 || c.roi_fraction.x + c.roi_fraction.width > 1 ||
-      c.roi_fraction.y + c.roi_fraction.height > 1)
-    throw std::runtime_error("invalid roi_fraction");
+  if (c.input_width <= 0 || c.input_height <= 0)
+    throw std::runtime_error("input_width and input_height must be positive");
+  if (c.process_width < 80)
+    throw std::runtime_error("process_width must be at least 80, got " +
+                             std::to_string(c.process_width));
+  if (c.processHeight() < 60)
+    throw std::runtime_error("process_width " + std::to_string(c.process_width) + " over " +
+                             std::to_string(c.input_width) + "x" + std::to_string(c.input_height) +
+                             " gives a processing height of " + std::to_string(c.processHeight()) +
+                             ", which is too small");
+  if (c.roi.width <= 0 || c.roi.height <= 0 || c.roi.x < 0 || c.roi.y < 0 ||
+      c.roi.x + c.roi.width > c.input_width || c.roi.y + c.roi.height > c.input_height)
+    throw std::runtime_error(
+        "roi [" + std::to_string(c.roi.x) + ", " + std::to_string(c.roi.y) + ", " +
+        std::to_string(c.roi.width) + ", " + std::to_string(c.roi.height) +
+        "] must stay inside the input image " + std::to_string(c.input_width) + "x" +
+        std::to_string(c.input_height));
   if (c.road_hsv.h_min < 0 || c.road_hsv.h_min > 179 ||
       c.road_hsv.h_max < 0 || c.road_hsv.h_max > 179 || c.road_hsv.s_min < 0 ||
       c.road_hsv.s_max > 255 || c.road_hsv.v_min < 0 || c.road_hsv.v_max > 255 ||
@@ -472,9 +513,15 @@ void validateConfig(const Config& c) {
       c.min_road_width_fraction <= 0 || c.max_road_width_fraction > 1 ||
       c.min_road_width_fraction >= c.max_road_width_fraction ||
       c.lookahead_fraction <= 0 || c.lookahead_fraction >= 1 ||
-      c.roi_fraction.y + c.roi_fraction.height < 0.8f ||
       c.minimum_confidence < 0 || c.minimum_confidence > 1)
     throw std::runtime_error("invalid detection parameter");
+  // The road profile is grown from the bottom of the window, so the window has
+  // to reach down to the bottom of the image.
+  if (c.roi.y + c.roi.height < static_cast<int>(0.8f * c.input_height))
+    throw std::runtime_error(
+        "roi must reach at least 80% of the input height (" +
+        std::to_string(static_cast<int>(0.8f * c.input_height)) + " px); got " +
+        std::to_string(c.roi.y + c.roi.height));
   if (c.use_perspective) {
     std::vector<cv::Point2f> src(c.perspective_src.begin(), c.perspective_src.end());
     std::vector<cv::Point2f> dst(c.perspective_dst.begin(), c.perspective_dst.end());
@@ -498,26 +545,69 @@ const char* toString(RoadType type) {
 
 RoadDetector::RoadDetector(Config config) : config_(std::move(config)) {
   validateConfig(config_);
-  vehicle_x_ = config_.process_width / 2.0f;
+  const int process_width = config_.process_width;
+  const int process_height = config_.processHeight();
+  const float sx = static_cast<float>(process_width) / config_.input_width;
+  const float sy = static_cast<float>(process_height) / config_.input_height;
+  vehicle_x_ = process_width / 2.0f;
   if (config_.use_perspective) {
     std::vector<cv::Point2f> src(config_.perspective_src.begin(), config_.perspective_src.end());
     std::vector<cv::Point2f> dst(config_.perspective_dst.begin(), config_.perspective_dst.end());
-    const float sx = static_cast<float>(config_.process_width) / config_.input_width;
-    const float sy = static_cast<float>(config_.process_height) / config_.input_height;
     for (auto& p : src) { p.x *= sx; p.y *= sy; }
     for (auto& p : dst) { p.x *= sx; p.y *= sy; }
     warp_ = cv::getPerspectiveTransform(src, dst);
     inverse_warp_ = warp_.inv();
-    std::vector<cv::Point2f> vehicle{{config_.process_width / 2.0f,
-                                      config_.process_height * 0.95f}}, projected;
+    std::vector<cv::Point2f> vehicle{{process_width / 2.0f, process_height * 0.95f}}, projected;
     cv::perspectiveTransform(vehicle, projected, warp_);
     vehicle_x_ = projected.front().x;
   }
+
+  // The configured window lives in input-image pixels; everything below works on
+  // the processed image, and with perspective a rectangle becomes a quad, so the
+  // bounding box is what the detector can use as a search window.
+  const cv::Rect2f& roi = config_.roi;
+  std::vector<cv::Point2f> corners{
+      {roi.x * sx, roi.y * sy},
+      {(roi.x + roi.width) * sx, roi.y * sy},
+      {(roi.x + roi.width) * sx, (roi.y + roi.height) * sy},
+      {roi.x * sx, (roi.y + roi.height) * sy}};
+  cv::Rect2f processed(roi.x * sx, roi.y * sy, roi.width * sx, roi.height * sy);
+  if (config_.use_perspective) {
+    cv::perspectiveTransform(corners, corners, warp_);
+    float min_x = corners.front().x, max_x = corners.front().x;
+    float min_y = corners.front().y, max_y = corners.front().y;
+    for (const cv::Point2f& corner : corners) {
+      min_x = std::min(min_x, corner.x);
+      max_x = std::max(max_x, corner.x);
+      min_y = std::min(min_y, corner.y);
+      max_y = std::max(max_y, corner.y);
+    }
+    processed = cv::Rect2f(min_x, min_y, max_x - min_x, max_y - min_y);
+  }
+  const cv::Rect2f image(0, 0, process_width, process_height);
+  if ((processed & image).area() <= 0)
+    throw std::runtime_error(
+        "roi lies outside the processed image; check roi and the perspective points");
+  processed &= image;
+  roi_processed_ = cv::Rect(cvRound(processed.x), cvRound(processed.y),
+                            cvRound(processed.width), cvRound(processed.height));
+
+  // Report the region the detector really uses: the corners of that window,
+  // mapped back to input-image pixels for the preview and the --overlay export.
+  const float left = static_cast<float>(roi_processed_.x);
+  const float top = static_cast<float>(roi_processed_.y);
+  const float right = static_cast<float>(roi_processed_.x + roi_processed_.width);
+  const float bottom = static_cast<float>(roi_processed_.y + roi_processed_.height);
+  std::vector<cv::Point2f> used{{left, top}, {right, top}, {right, bottom}, {left, bottom}};
+  if (config_.use_perspective) cv::perspectiveTransform(used, used, inverse_warp_);
+  roi_polygon_.reserve(used.size());
+  for (const cv::Point2f& point : used)
+    roi_polygon_.emplace_back(point.x / sx, point.y / sy);
 }
 
 cv::Mat RoadDetector::segment(const cv::Mat& bgr) const {
   cv::Mat small, view, hsv;
-  cv::resize(bgr, small, cv::Size(config_.process_width, config_.process_height));
+  cv::resize(bgr, small, cv::Size(config_.process_width, config_.processHeight()));
   if (config_.use_perspective)
     cv::warpPerspective(small, view, warp_, small.size(), cv::INTER_LINEAR,
                         cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
@@ -541,10 +631,7 @@ cv::Mat RoadDetector::segment(const cv::Mat& bgr) const {
   const cv::Scalar right = medianHsv(hsv, right_seed);
   cv::Mat smoothed;
   cv::GaussianBlur(view, smoothed, cv::Size(15, 7), 0);
-  const cv::Rect roi(static_cast<int>(config_.roi_fraction.x * w),
-                     static_cast<int>(config_.roi_fraction.y * h),
-                     static_cast<int>(config_.roi_fraction.width * w),
-                     static_cast<int>(config_.roi_fraction.height * h));
+  const cv::Rect& roi = roi_processed_;
   cv::Mat candidates = cv::Mat::zeros(hsv.size(), CV_8UC1);
   for (int y = roi.y; y < std::min(h, roi.y + roi.height); ++y) {
     const auto* pixels = hsv.ptr<cv::Vec3b>(y);
@@ -598,8 +685,9 @@ RoadResult RoadDetector::process(const cv::Mat& bgr, std::int64_t timestamp_ms) 
     throw std::invalid_argument("expected 1280x720 CV_8UC3 BGR frame (or configured input size)");
   const float previous_center = previous_center_x_;
   RoadResult result = analyzeMask(segment(bgr), timestamp_ms);
+  result.roi_polygon = roi_polygon_;
   cv::Mat processed, view;
-  cv::resize(bgr, processed, cv::Size(config_.process_width, config_.process_height));
+  cv::resize(bgr, processed, cv::Size(config_.process_width, config_.processHeight()));
   if (config_.use_perspective)
     cv::warpPerspective(processed, view, warp_, processed.size(), cv::INTER_LINEAR,
                         cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
@@ -623,9 +711,11 @@ RoadResult RoadDetector::process(const cv::Mat& bgr, std::int64_t timestamp_ms) 
 
 RoadResult RoadDetector::processMask(const cv::Mat& mask, std::int64_t timestamp_ms) {
   if (mask.empty() || mask.type() != CV_8UC1 || mask.cols != config_.process_width ||
-      mask.rows != config_.process_height)
+      mask.rows != config_.processHeight())
     throw std::invalid_argument("mask size/type does not match configured processing size");
-  return analyzeMask(keepBottomConnected(mask), timestamp_ms);
+  RoadResult result = analyzeMask(keepBottomConnected(mask), timestamp_ms);
+  result.roi_polygon = roi_polygon_;
+  return result;
 }
 
 RoadType RoadDetector::stabilize(RoadType current) {
@@ -646,7 +736,7 @@ cv::Point2f RoadDetector::sourcePoint(const cv::Point2f& processed) const {
     point = out.front();
   }
   point.x *= static_cast<float>(config_.input_width) / config_.process_width;
-  point.y *= static_cast<float>(config_.input_height) / config_.process_height;
+  point.y *= static_cast<float>(config_.input_height) / config_.processHeight();
   return point;
 }
 
@@ -658,10 +748,9 @@ bool RoadDetector::refineWithEdges(const cv::Mat& image, RoadResult& result) {
   const int w = image.cols, h = image.rows;
   const cv::Scalar road_model = medianHsv(hsv, cv::Rect(w * 44 / 100, h * 36 / 100,
                                                        w * 12 / 100, h * 14 / 100));
-  const int first_y = std::max(static_cast<int>(h * 0.17f),
-                               static_cast<int>(config_.roi_fraction.y * h) + 5);
-  const int last_y = std::min(h - 15, static_cast<int>(
-      (config_.roi_fraction.y + config_.roi_fraction.height) * h) - 5);
+  const cv::Rect& roi = roi_processed_;
+  const int first_y = std::max(static_cast<int>(h * 0.17f), roi.y + 5);
+  const int last_y = std::min(h - 15, roi.y + roi.height - 5);
   const auto edgeScore = [&](int y, int x, int side) -> float {
     const cv::Vec3b a = smooth.at<cv::Vec3b>(y, x - 12);
     const cv::Vec3b b = smooth.at<cv::Vec3b>(y, x + 12);
@@ -832,9 +921,9 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   std::vector<cv::Point2f> left, right;
   std::vector<float> widths;
   float predicted = previous_center_x_ < 0 ? vehicle_x_ : previous_center_x_;
-  const int y_top = std::max(1, static_cast<int>(config_.roi_fraction.y * h));
-  const int y_bottom = std::min(h - 2, static_cast<int>((config_.roi_fraction.y +
-                                                         config_.roi_fraction.height) * h) - 1);
+  const cv::Rect& roi = roi_processed_;
+  const int y_top = std::max(1, roi.y);
+  const int y_bottom = std::min(h - 2, roi.y + roi.height - 1);
   int examined = 0;
   for (int y = y_bottom; y >= y_top; y -= 6) {
     ++examined;

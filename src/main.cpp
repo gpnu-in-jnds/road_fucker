@@ -120,6 +120,18 @@ void printResult(const road_finder::RoadResult& r) {
   std::cout << '}' << std::endl;
 }
 
+// One line that says what the configuration resolved to, so a typo in
+// process_width or roi shows up immediately instead of as missing detections.
+void logGeometry(const road_finder::Config& config, const road_finder::RoadDetector& detector) {
+  const cv::Rect2f& roi = detector.processRoi();
+  std::cerr << "geometry: input " << config.input_width << 'x' << config.input_height
+            << ", process " << config.process_width << 'x' << config.processHeight()
+            << ", roi [" << config.roi.x << ',' << config.roi.y << ',' << config.roi.width << ','
+            << config.roi.height << "] input px -> [" << roi.x << ',' << roi.y << ',' << roi.width
+            << ',' << roi.height << "] "
+            << (config.use_perspective ? "warped px" : "process px") << '\n';
+}
+
 std::int64_t nowMilliseconds() {
   using namespace std::chrono;
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -189,6 +201,7 @@ int main(int argc, char** argv) {
 
     const road_finder::Config config = road_finder::loadConfig(options.config);
     road_finder::RoadDetector detector(config);
+    logGeometry(config, detector);
     return camera_source ? runCamera(options, config, detector) : runImage(options, detector);
   } catch (const std::exception& error) {
     std::cerr << "road_finder: " << error.what() << '\n';
