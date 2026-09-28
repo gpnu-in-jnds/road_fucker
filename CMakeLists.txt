@@ -27,4 +27,9 @@ if(BUILD_TESTING)
   target_compile_definitions(road_finder_tests PRIVATE
     ROAD_FINDER_SAMPLE_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/frame_784.png")
   add_test(NAME road_finder_tests COMMAND road_finder_tests)
+
+  add_executable(road_finder_preview_tests tests/preview_window_test.cpp)
+  target_link_libraries(road_finder_preview_tests PRIVATE road_finder_lib)
+  target_compile_options(road_finder_preview_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME road_finder_preview_tests COMMAND road_finder_preview_tests)
 endif()

@@ -47,8 +47,11 @@ ctest --test-dir build --output-on-failure
 `RIGHT BRANCH`、`T JUNCTION`、`UNKNOWN` 和 `LOST`；`LOST` 表示本帧没有
 有效的循迹几何结果，并不表示道路终止。FPS 统计完整的读取、处理、输出与显示循环，
 每秒更新一次，开始时显示 `MEASURING`，不是视频文件声明的帧率。
-按 Esc 或 Q、关闭窗口、或播放到文件末尾时结束预览。`--display` 需要图形桌面环境；
-无显示器时不加该参数仍可逐帧输出 JSON。
+按 Esc 或 Q、关闭窗口、或播放到文件末尾时结束预览，并在 stderr 打印实际停止原因。
+`--display` 需要图形桌面环境；无显示器时不加该参数仍可逐帧输出 JSON。
+在 GTK 后端的 OpenCV（RDK X5、Ubuntu 自带 OpenCV 4）上，highgui 没有实现用于检测
+关窗的 `WND_PROP_VISIBLE` 属性，点窗口关闭按钮后 OpenCV 会重新创建预览窗口；
+请用 Esc、Q 或 Ctrl+C 结束预览，程序会在若干帧后提示一次该限制。
 
 每帧在 stdout 输出一行 JSON，处理耗时和错误写入 stderr。字段包含
 `timestamp_ms`、`valid`、`type`、`directions`、`confidence`、
@@ -56,6 +59,40 @@ ctest --test-dir build --output-on-failure
 `centerline`。边线和中线坐标均基于原始 720p 图像。横向偏差按半幅道路宽度归一化，
 目标中线在车体右侧时为正；方向偏差向右为正。`confidence` 表示道路几何结果的可信度；
 路口仍在连续帧确认期间时，可能同时出现有效中线和 `UNKNOWN` 路口类型。
+
+## 故障排查
+
+### 预览窗口黑屏且一帧后退出
+
+旧版本用 `cv::getWindowProperty(..., cv::WND_PROP_VISIBLE) < 1` 判断用户是否关闭了窗口。
+GTK 后端的 highgui 没有实现该属性（[opencv/opencv#25346](https://github.com/opencv/opencv/issues/25346)），
+OpenCV 会把后端返回的 NaN 映射成 -1，于是 `-1 < 1` 在第一帧后就让预览循环 `break`：
+窗口还没绘制就退出，表现为黑屏、一帧后静默退出（退出码 0、stderr 无错误）。
+现在只有“曾经报告过可见、随后报告不可见”才算关闭；`-1`、`NaN` 或探测抛异常一律视为
+“后端无法作答”，预览继续运行。停止时程序会打印 `preview stopped by key`、
+`preview window closed` 或 `end of video source` 之一，不再静默退出。
+
+查看当前使用的 highgui 后端：
+
+```sh
+OPENCV_LOG_LEVEL=DEBUG ./build/road_finder --source /dev/video0 --display --no-json 2>&1 \
+  | grep -E 'UI:|backend'
+```
+
+### 找不到 freedesktop.org 服务之类的警告
+
+启动 `--display` 时可能出现 `freedesktop.org`、`org.freedesktop.*` 服务的警告。
+这是 GTK/GLib 在目标机的 XFCE 会话里找不到会话 D-Bus 服务（例如 desktop portal）时的
+环境提示，与摄像头、检测算法和预览窗口无关，也不会导致程序退出。需要确认完整文本时：
+
+```sh
+G_MESSAGES_DEBUG=all ./build/road_finder --source /dev/video0 --display --no-json 2>&1 \
+  | tee /tmp/road_finder.log
+```
+
+若文本指向 `org.freedesktop.portal.Desktop`，可在镜像里安装并启用 `xdg-desktop-portal`
+与 `xdg-desktop-portal-gtk`，或直接在 XFCE 会话内的终端启动程序，使
+`DBUS_SESSION_BUS_ADDRESS` 存在。无显示器的 `--no-json` 运行不受影响。
 
 ## 现场标定
 

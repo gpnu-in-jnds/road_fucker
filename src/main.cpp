@@ -1,3 +1,4 @@
+#include "road_finder/preview_window.hpp"
 #include "road_finder/road_detector.hpp"
 
 #include <opencv2/highgui.hpp>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -226,9 +228,15 @@ cv::Mat annotate(const cv::Mat& frame, const road_finder::RoadResult& result,
 }
 
 void openPreviewWindow(const cv::Size& image_size) {
-  cv::namedWindow(kPreviewWindow, cv::WINDOW_NORMAL | cv::WINDOW_KEEPRATIO |
-                                     cv::WINDOW_GUI_NORMAL);
-  cv::resizeWindow(kPreviewWindow, image_size);
+  try {
+    cv::namedWindow(kPreviewWindow, cv::WINDOW_NORMAL | cv::WINDOW_KEEPRATIO |
+                                       cv::WINDOW_GUI_NORMAL);
+    cv::resizeWindow(kPreviewWindow, image_size);
+  } catch (const cv::Exception& error) {
+    throw std::runtime_error(
+        std::string("cannot create the preview window: ") + error.what() +
+        "; check DISPLAY and that OpenCV highgui has a GUI backend, or run without --display");
+  }
 }
 
 std::int64_t nowMilliseconds() {
@@ -303,6 +311,9 @@ int main(int argc, char** argv) {
     }
     if (options.display) openPreviewWindow({config.input_width, config.input_height});
     DisplayFps display_fps;
+    road_finder::PreviewWindowState preview;
+    bool unusable_visibility_reported = false;
+    std::string stop_reason;
     cv::Mat frame;
     bool resize_reported = false;
     bool received_frame = false;
@@ -313,6 +324,7 @@ int main(int argc, char** argv) {
                                    "; test the device with v4l2-ctl -d " + options.source +
                                    " --stream-mmap --stream-count=10");
         if (!received_frame) throw std::runtime_error("video source contains no frames");
+        stop_reason = "end of video source";
         break;
       }
       received_frame = true;
@@ -327,15 +339,32 @@ int main(int argc, char** argv) {
         cv::imshow(kPreviewWindow, annotate(bgr, result, display_fps.value(), true));
         const int key = cv::waitKey(1);
         display_fps.frameCompleted();
-        if (key == 27 || key == 'q' || key == 'Q') break;
+        if (key == 27 || key == 'q' || key == 'Q') {
+          stop_reason = "preview stopped by key";
+          break;
+        }
+        double visible = std::numeric_limits<double>::quiet_NaN();
         try {
-          if (cv::getWindowProperty(kPreviewWindow, cv::WND_PROP_VISIBLE) < 1) break;
+          visible = cv::getWindowProperty(kPreviewWindow, cv::WND_PROP_VISIBLE);
         } catch (const cv::Exception&) {
-          break; // Some GUI backends throw after the window is closed.
+          // A backend that cannot answer is not a closed window; the GTK backend
+          // reports -1 here because it does not implement WND_PROP_VISIBLE.
+        }
+        if (preview.observeVisible(visible) ==
+            road_finder::PreviewWindowState::Decision::kWindowClosed) {
+          stop_reason = "preview window closed";
+          break;
+        }
+        if (!unusable_visibility_reported && preview.visibility_reporting_unavailable()) {
+          std::cerr << "\npreview backend does not report WND_PROP_VISIBLE (the OpenCV GTK "
+                       "backend does not implement it); window-close detection is disabled, "
+                       "stop the preview with Esc or Q\n";
+          unusable_visibility_reported = true;
         }
       }
     }
     std::cerr << '\n';
+    if (!stop_reason.empty()) std::cerr << stop_reason << '\n';
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "road_finder: " << error.what() << '\n';
