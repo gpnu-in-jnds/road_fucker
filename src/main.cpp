@@ -8,6 +8,7 @@
 #include <chrono>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -22,6 +23,8 @@ struct Options {
   std::string config = "config/road_finder.yaml";
   std::string overlay_path;
   std::string mask_path;
+  std::string camera_fourcc;
+  double camera_fps = 30.0;
   bool display = false;
   bool no_json = false;
 };
@@ -30,7 +33,9 @@ constexpr const char* kPreviewWindow = "road_finder preview";
 
 void usage() {
   std::cout << "road_finder --source <camera index|video|image|GStreamer pipeline> "
-               "[--config file] [--display] [--no-json] [--overlay file] [--mask file]\n";
+               "[--config file] [--display] [--no-json] [--camera-fourcc MJPG] "
+               "[--camera-fps 30] "
+               "[--overlay file] [--mask file]\n";
 }
 
 Options parse(int argc, char** argv) {
@@ -44,7 +49,14 @@ Options parse(int argc, char** argv) {
     const std::string value = argv[++i];
     if (arg == "--source") options.source = value;
     else if (arg == "--config") options.config = value;
-    else if (arg == "--overlay") options.overlay_path = value;
+    else if (arg == "--camera-fourcc") options.camera_fourcc = value;
+    else if (arg == "--camera-fps") {
+      std::size_t parsed = 0;
+      options.camera_fps = std::stod(value, &parsed);
+      if (parsed != value.size() || !std::isfinite(options.camera_fps) ||
+          options.camera_fps <= 0.0)
+        throw std::runtime_error("--camera-fps must be a positive number");
+    } else if (arg == "--overlay") options.overlay_path = value;
     else if (arg == "--mask") options.mask_path = value;
     else throw std::runtime_error("unknown argument: " + arg);
   }
@@ -63,6 +75,48 @@ bool isImage(const std::string& source) {
 bool isCameraIndex(const std::string& source) {
   return !source.empty() &&
          source.find_first_not_of("0123456789") == std::string::npos;
+}
+
+bool isVideoDevice(const std::string& source) {
+  constexpr const char* prefix = "/dev/video";
+  const std::string suffix = source.rfind(prefix, 0) == 0 ? source.substr(10) : "";
+  return !suffix.empty() && suffix.find_first_not_of("0123456789") == std::string::npos;
+}
+
+cv::Mat prepareVideoFrame(const cv::Mat& frame, const road_finder::Config& config,
+                          bool camera_source, bool& resize_reported) {
+  if (frame.empty()) throw std::runtime_error("video source returned an empty frame");
+  cv::Mat bgr;
+  if (frame.depth() != CV_8U)
+    throw std::runtime_error("video source must return 8-bit frames");
+  if (frame.channels() == 3) bgr = frame;
+  else if (frame.channels() == 1) cv::cvtColor(frame, bgr, cv::COLOR_GRAY2BGR);
+  else if (frame.channels() == 4) cv::cvtColor(frame, bgr, cv::COLOR_BGRA2BGR);
+  else
+    throw std::runtime_error("unsupported camera frame: " +
+                             std::to_string(frame.channels()) + " channels");
+
+  const cv::Size expected(config.input_width, config.input_height);
+  if (bgr.size() == expected) return bgr;
+  const std::string actual = std::to_string(bgr.cols) + "x" + std::to_string(bgr.rows);
+  const std::string wanted = std::to_string(expected.width) + "x" +
+                             std::to_string(expected.height);
+  const double aspect_error = std::abs(static_cast<double>(bgr.cols) / bgr.rows -
+                                       static_cast<double>(expected.width) / expected.height);
+  if (!camera_source || aspect_error > 0.01) {
+    const std::string advice = camera_source
+        ? "; select a 16:9 camera mode with v4l2-ctl or change the input size in config"
+        : "; change the input size in config";
+    throw std::runtime_error("source delivered " + actual + ", expected " + wanted + advice);
+  }
+  if (!resize_reported) {
+    std::cerr << "camera delivered " << actual << "; resizing to " << wanted
+              << " for detection. Calibrate against the actual camera resolution.\n";
+    resize_reported = true;
+  }
+  cv::Mat resized;
+  cv::resize(bgr, resized, expected, 0, 0, cv::INTER_LINEAR);
+  return resized;
 }
 
 void printResult(const road_finder::RoadResult& r) {
@@ -208,29 +262,69 @@ int main(int argc, char** argv) {
     }
     if (!options.overlay_path.empty() || !options.mask_path.empty())
       throw std::runtime_error("--overlay and --mask are available for image sources only");
+    const bool camera_source = isCameraIndex(options.source) || isVideoDevice(options.source);
+    if (!options.camera_fourcc.empty() && !camera_source)
+      throw std::runtime_error("--camera-fourcc requires a camera index or /dev/videoN source");
+    if (!options.camera_fourcc.empty() && options.camera_fourcc.size() != 4)
+      throw std::runtime_error("--camera-fourcc must contain exactly four characters");
     cv::VideoCapture capture;
     if (isCameraIndex(options.source)) {
       capture.open(std::stoi(options.source), cv::CAP_ANY);
-      capture.set(cv::CAP_PROP_FRAME_WIDTH, config.input_width);
-      capture.set(cv::CAP_PROP_FRAME_HEIGHT, config.input_height);
+    } else if (isVideoDevice(options.source)) {
+      const int device_index = std::stoi(options.source.substr(10));
+      capture.open(device_index, cv::CAP_V4L2);
     } else if (options.source.find('!') != std::string::npos) {
       capture.open(options.source, cv::CAP_GSTREAMER);
     } else {
       capture.open(options.source, cv::CAP_ANY);
     }
-    if (!capture.isOpened()) throw std::runtime_error("cannot open source: " + options.source);
+    if (!capture.isOpened())
+      throw std::runtime_error("cannot open source: " + options.source +
+                               (isVideoDevice(options.source) ? " with V4L2" : ""));
+    if (camera_source) {
+      // UVC cameras often provide 720p at full frame rate only in MJPG mode.
+      const std::string code = options.camera_fourcc.empty() && isVideoDevice(options.source)
+                                   ? "MJPG" : options.camera_fourcc;
+      if (!code.empty()) {
+        if (!capture.set(cv::CAP_PROP_FOURCC,
+                         cv::VideoWriter::fourcc(code[0], code[1], code[2], code[3])))
+          std::cerr << "camera did not accept FOURCC " << code << '\n';
+      }
+      capture.set(cv::CAP_PROP_FRAME_WIDTH, config.input_width);
+      capture.set(cv::CAP_PROP_FRAME_HEIGHT, config.input_height);
+      if (!capture.set(cv::CAP_PROP_FPS, options.camera_fps))
+        std::cerr << "camera did not accept requested " << options.camera_fps << " FPS\n";
+      capture.set(cv::CAP_PROP_CONVERT_RGB, 1);
+      std::cerr << "camera requested " << config.input_width << 'x' << config.input_height
+                << ", negotiated " << static_cast<int>(capture.get(cv::CAP_PROP_FRAME_WIDTH))
+                << 'x' << static_cast<int>(capture.get(cv::CAP_PROP_FRAME_HEIGHT))
+                << " at " << capture.get(cv::CAP_PROP_FPS) << " FPS via "
+                << capture.getBackendName() << '\n';
+    }
     if (options.display) openPreviewWindow({config.input_width, config.input_height});
     DisplayFps display_fps;
     cv::Mat frame;
-    while (capture.read(frame)) {
+    bool resize_reported = false;
+    bool received_frame = false;
+    while (true) {
+      if (!capture.read(frame) || frame.empty()) {
+        if (camera_source)
+          throw std::runtime_error("camera did not deliver a frame from " + options.source +
+                                   "; test the device with v4l2-ctl -d " + options.source +
+                                   " --stream-mmap --stream-count=10");
+        if (!received_frame) throw std::runtime_error("video source contains no frames");
+        break;
+      }
+      received_frame = true;
       const auto start = std::chrono::steady_clock::now();
-      const auto result = detector.process(frame, nowMilliseconds());
+      const cv::Mat bgr = prepareVideoFrame(frame, config, camera_source, resize_reported);
+      const auto result = detector.process(bgr, nowMilliseconds());
       if (!options.no_json) printResult(result);
       const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - start).count();
       std::cerr << "frame processing: " << elapsed << " ms\r";
       if (options.display) {
-        cv::imshow(kPreviewWindow, annotate(frame, result, display_fps.value(), true));
+        cv::imshow(kPreviewWindow, annotate(bgr, result, display_fps.value(), true));
         const int key = cv::waitKey(1);
         display_fps.frameCompleted();
         if (key == 27 || key == 'q' || key == 'Q') break;

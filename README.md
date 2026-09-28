@@ -19,6 +19,8 @@ ctest --test-dir build --output-on-failure
 
 ```sh
 ./build/road_finder --source 0 --config config/road_finder.yaml
+./build/road_finder --source /dev/video2 --display --no-json
+./build/road_finder --source /dev/video2 --camera-fourcc MJPG --camera-fps 30 --display --no-json
 ./build/road_finder --source 0 --display --no-json
 ./build/road_finder --source recording.mp4 --display --no-json
 ./build/road_finder --source frame.png --display --no-json
@@ -26,7 +28,17 @@ ctest --test-dir build --output-on-failure
 ```
 
 `--source` 接受摄像头序号、视频文件、图片，或以 `appsink` 结束的 GStreamer 管道。
-对摄像头序号会请求 1280×720；实际帧、视频文件及图片均须为此尺寸，否则明确报错。
+摄像头也可用 `/dev/videoN` 路径；这两种摄像头来源都会请求配置中的 1280×720
+和默认的 30 FPS。`/dev/videoN` 默认先选择 MJPG，以支持常见 UVC 摄像头的
+720p/30 FPS 模式；可用 `--camera-fourcc`、`--camera-fps` 覆盖。程序会打印
+驱动协商后的分辨率和帧率。
+若摄像头只返回其他 16:9 分辨率，程序会保持宽高比缩放至配置尺寸后检测，
+并在 stderr 提示；其他宽高比会报出实际尺寸。视频文件及图片仍须符合配置尺寸。
+先用 `v4l2-ctl -d /dev/video2 --list-formats-ext` 确认设备支持的格式、分辨率和帧率。
+若出现 `VIDIOC_QBUF` 错误或无法取帧，先用
+`v4l2-ctl -d /dev/video2 --set-fmt-video=width=1280,height=720,pixelformat=MJPG --set-parm=30 --stream-mmap --stream-count=10`
+独立测试相同的设备模式；
+若该命令也失败，则需检查摄像头驱动、USB 连接或设备占用。
 `--overlay`、`--mask` 只用于单张图片。视频预览逐帧显示最终拟合的左边线
 （青色）、右边线（橙色）和中线（绿色），以及当前路况、置信度和实际显示帧率。
 预览窗口按 1280×720 画面尺寸打开，并保持原始宽高比；仍可手动调整窗口大小。
