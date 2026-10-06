@@ -94,11 +94,19 @@ Camera::Camera(const std::string& source, const CameraOptions& options, const Co
   if (!capture_.set(cv::CAP_PROP_FPS, options.fps))
     std::cerr << "camera did not accept requested " << options.fps << " FPS\n";
   capture_.set(cv::CAP_PROP_CONVERT_RGB, 1);
+  // One buffer keeps the frame that is read as fresh as possible; not every
+  // backend accepts it, and the frame rate does not depend on it.
+  capture_.set(cv::CAP_PROP_BUFFERSIZE, 1);
+  const double negotiated_fps = capture_.get(cv::CAP_PROP_FPS);
   std::cerr << "camera requested " << config.input_width << 'x' << config.input_height
             << ", negotiated " << static_cast<int>(capture_.get(cv::CAP_PROP_FRAME_WIDTH))
             << 'x' << static_cast<int>(capture_.get(cv::CAP_PROP_FRAME_HEIGHT))
-            << " at " << capture_.get(cv::CAP_PROP_FPS) << " FPS via "
-            << capture_.getBackendName() << '\n';
+            << " at " << negotiated_fps << " FPS via " << capture_.getBackendName() << '\n';
+  if (negotiated_fps > 0.0 && negotiated_fps < options.fps * 0.5)
+    std::cerr << "camera negotiated " << negotiated_fps << " FPS (requested " << options.fps
+              << "); the preview cannot run faster than the camera mode - check "
+                 "v4l2-ctl -d " << source_ << " --list-formats-ext and prefer MJPG at "
+              << config.input_width << 'x' << config.input_height << '\n';
 }
 
 void Camera::read(cv::Mat& bgr) {

@@ -66,6 +66,40 @@ ctest --test-dir build --output-on-failure
 目标中线在车体右侧时为正；方向偏差向右为正。`confidence` 表示道路几何结果的可信度；
 路口仍在连续帧确认期间时，可能同时出现有效中线和 `UNKNOWN` 路口类型。
 
+## 性能与帧率
+
+程序每秒在 stderr 打印一行分阶段耗时，用来判断时间到底花在哪里：
+
+```
+fps 5.2 | read 12.1 ms | detect 41.3 ms | preview 122.5 ms | frames 26
+```
+
+`read` 是等摄像头出帧（含 MJPG 解码），`detect` 是检测算法，`preview` 是叠加绘制 + `imshow` +
+`waitKey`。`--benchmark <frames>` 跑固定帧数后打印各阶段均值并退出，便于前后对比：
+
+```sh
+./build/road_finder --benchmark 300 --no-display   # 只测检测吞吐（也可以配图片源）
+./build/road_finder --benchmark 300                # 含预览，两行相减就是显示开销
+```
+
+按结果对症下药：
+
+| 耗时最大的一段 | 处理办法 |
+| --- | --- |
+| `read` | 多半是摄像头模式而不是程序：用 `v4l2-ctl -d /dev/video0 --list-formats-ext` 确认 720p 下有 MJPG/30fps；启动日志里的 `camera negotiated ... FPS` 明显低于请求时程序会提示 |
+| `detect` | 收紧 `roi`、降低 `process_width`（像素阈值需一起复评）；检测已默认多线程，可用 `--threads 1` 对比 |
+| `preview` | 用 `--preview-scale 0.5` 缩小预览，或用 `--preview-fps 15` 限制重绘频率（检测仍逐帧） |
+
+相关选项（全部可选，不加参数时行为与之前一致）：
+
+- `--preview-scale <0.1..1.0>`：预览画面与窗口按比例缩小。OpenCV 的 GTK 后端每帧都要做一次
+  全帧 BGR→RGB 转换，窗口小于画面时还要再做一次 `INTER_AREA` 缩放，最后用 cairo 软件绘制，
+  所以显示开销基本与像素数成正比；RDK X5 上建议 `0.5`（像素数降到 1/4）。
+- `--preview-fps <Hz>`：限制预览重绘频率，检测与 JSON 输出不受影响（按键、关窗检测仍每帧处理）。
+- `--threads <N>`：设置 OpenCV 线程数；默认用 CPU 核数（X5 为 4 核），`--threads 1` 关闭并行。
+  并行只用于彼此独立的行扫描与骨架化单趟，输出与单线程完全一致。
+- `--benchmark <frames>`：跑固定帧数后打印统计并退出，方便在目标机上量化每次调整。
+
 ## 故障排查
 
 ### 预览窗口黑屏且一帧后退出

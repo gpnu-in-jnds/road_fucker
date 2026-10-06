@@ -62,14 +62,20 @@ void rejectDeprecatedKeys(const cv::FileNode& root, const Config& c) {
   }
 }
 
-cv::Scalar medianHsv(const cv::Mat& hsv, cv::Rect rect) {
+// Channels are caller-owned scratch: the same three buffers are reused for
+// every frame, so only the first frame pays for the allocations.
+cv::Scalar medianHsv(const cv::Mat& hsv, cv::Rect rect, std::array<std::vector<int>, 3>& channels) {
   rect &= cv::Rect(0, 0, hsv.cols, hsv.rows);
+  for (auto& values : channels) values.clear();
   if (rect.empty()) return cv::Scalar(0, 0, 0);
-  std::array<std::vector<int>, 3> channels;
+  const std::size_t wanted = static_cast<std::size_t>(rect.width) * rect.height;
+  for (auto& values : channels) values.reserve(wanted);
   for (int y = rect.y; y < rect.y + rect.height; ++y) {
+    const cv::Vec3b* row = hsv.ptr<cv::Vec3b>(y);
     for (int x = rect.x; x < rect.x + rect.width; ++x) {
-      const auto pixel = hsv.at<cv::Vec3b>(y, x);
-      for (int c = 0; c < 3; ++c) channels[c].push_back(pixel[c]);
+      channels[0].push_back(row[x][0]);
+      channels[1].push_back(row[x][1]);
+      channels[2].push_back(row[x][2]);
     }
   }
   cv::Scalar result;
@@ -81,7 +87,7 @@ cv::Scalar medianHsv(const cv::Mat& hsv, cv::Rect rect) {
   return result;
 }
 
-float hsvDistance(const cv::Vec3b& pixel, const cv::Scalar& model) {
+float hsvDistanceSquared(const cv::Vec3b& pixel, const cv::Scalar& model) {
   const float s = static_cast<float>(pixel[1]);
   const float model_s = static_cast<float>(model[1]);
   float hue = std::abs(static_cast<float>(pixel[0] - model[0]));
@@ -89,39 +95,14 @@ float hsvDistance(const cv::Vec3b& pixel, const cv::Scalar& model) {
   if (s < 15.0f || model_s < 15.0f) hue = 0.0f;
   const float ds = s - model_s;
   const float dv = static_cast<float>(pixel[2] - model[2]);
-  return std::sqrt(0.6f * hue * hue + 0.7f * ds * ds + dv * dv);
+  return 0.6f * hue * hue + 0.7f * ds * ds + dv * dv;
 }
 
-bool withinHsv(const cv::Vec3b& p, const HsvRange& r) {
-  const bool hue = r.h_min <= r.h_max ? (p[0] >= r.h_min && p[0] <= r.h_max)
-                                     : (p[0] >= r.h_min || p[0] <= r.h_max);
-  return (p[1] < 15 || hue) && p[1] >= r.s_min && p[1] <= r.s_max &&
-         p[2] >= r.v_min && p[2] <= r.v_max;
+float hsvDistance(const cv::Vec3b& pixel, const cv::Scalar& model) {
+  return std::sqrt(hsvDistanceSquared(pixel, model));
 }
 
-cv::Mat keepBottomConnected(const cv::Mat& mask) {
-  cv::Mat labels, stats, centroids;
-  const int count = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8);
-  int best = -1;
-  std::vector<int> seed_counts(count, 0);
-  const int y_start = mask.rows * 4 / 5;
-  const int x0 = mask.cols / 3;
-  const int x1 = mask.cols * 2 / 3;
-  for (int y = y_start; y < mask.rows; ++y)
-    for (int x = x0; x < x1; ++x)
-      ++seed_counts[labels.at<int>(y, x)];
-  int best_seeds = 0;
-  for (int label = 1; label < count; ++label) {
-    const int area = stats.at<int>(label, cv::CC_STAT_AREA);
-    if (seed_counts[label] > best_seeds && area > static_cast<int>(mask.total() / 500)) {
-      best = label;
-      best_seeds = seed_counts[label];
-    }
-  }
-  cv::Mat selected = cv::Mat::zeros(mask.size(), CV_8UC1);
-  if (best > 0) selected.setTo(255, labels == best);
-  return selected;
-}
+
 
 int neighborCount(const cv::Mat& binary, int y, int x) {
   int count = 0;
@@ -133,6 +114,15 @@ int neighborCount(const cv::Mat& binary, int y, int x) {
   return count;
 }
 
+// Rows and columns that hold no foreground pixel cannot produce a change, and
+// thinning eats the shape from the outside, so the work area shrinks as it goes.
+void trimThinBounds(const cv::Mat& binary, int& y_top, int& y_bottom, int& x_left, int& x_right) {
+  while (y_top <= y_bottom && cv::countNonZero(binary.row(y_top)) == 0) ++y_top;
+  while (y_bottom >= y_top && cv::countNonZero(binary.row(y_bottom)) == 0) --y_bottom;
+  while (x_left <= x_right && cv::countNonZero(binary.col(x_left)) == 0) ++x_left;
+  while (x_right >= x_left && cv::countNonZero(binary.col(x_right)) == 0) --x_right;
+}
+
 cv::Mat thin(const cv::Mat& mask) {
   cv::Mat binary;
   cv::threshold(mask, binary, 0, 1, cv::THRESH_BINARY);
@@ -141,29 +131,42 @@ cv::Mat thin(const cv::Mat& mask) {
   binary.col(0).setTo(0);
   binary.col(binary.cols - 1).setTo(0);
   cv::Mat marker = cv::Mat::zeros(binary.size(), CV_8UC1);
+  int y_top = 1, y_bottom = binary.rows - 2, x_left = 1, x_right = binary.cols - 2;
   for (int iteration = 0; iteration < 120; ++iteration) {
+    trimThinBounds(binary, y_top, y_bottom, x_left, x_right);
+    if (y_top > y_bottom || x_left > x_right) break;
+    const cv::Rect work(x_left, y_top, x_right - x_left + 1, y_bottom - y_top + 1);
+    cv::Mat work_binary = binary(work);
     int changed = 0;
     for (int pass = 0; pass < 2; ++pass) {
-      marker.setTo(0);
-      for (int y = 1; y < binary.rows - 1; ++y) {
-        for (int x = 1; x < binary.cols - 1; ++x) {
-          if (!binary.at<uchar>(y, x)) continue;
-          const int p2 = binary.at<uchar>(y - 1, x), p3 = binary.at<uchar>(y - 1, x + 1);
-          const int p4 = binary.at<uchar>(y, x + 1), p5 = binary.at<uchar>(y + 1, x + 1);
-          const int p6 = binary.at<uchar>(y + 1, x), p7 = binary.at<uchar>(y + 1, x - 1);
-          const int p8 = binary.at<uchar>(y, x - 1), p9 = binary.at<uchar>(y - 1, x - 1);
-          const int n = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
-          const int transitions = (!p2 && p3) + (!p3 && p4) + (!p4 && p5) +
-                                  (!p5 && p6) + (!p6 && p7) + (!p7 && p8) +
-                                  (!p8 && p9) + (!p9 && p2);
-          if (n < 2 || n > 6 || transitions != 1) continue;
-          const bool protect_a = pass == 0 ? p2 * p4 * p6 : p2 * p4 * p8;
-          const bool protect_b = pass == 0 ? p4 * p6 * p8 : p2 * p6 * p8;
-          if (!protect_a && !protect_b) marker.at<uchar>(y, x) = 1;
+      cv::Mat work_marker = marker(work);
+      work_marker.setTo(0);
+      // Within one pass every pixel only reads the frozen binary image, so the
+      // rows can be handed to the thread pool without changing the result.
+      cv::parallel_for_(cv::Range(y_top, y_bottom + 1), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+          const uchar* above = binary.ptr<uchar>(y - 1);
+          const uchar* current = binary.ptr<uchar>(y);
+          const uchar* below = binary.ptr<uchar>(y + 1);
+          uchar* out = marker.ptr<uchar>(y);
+          for (int x = x_left; x <= x_right; ++x) {
+            if (!current[x]) continue;
+            const int p2 = above[x], p3 = above[x + 1], p4 = current[x + 1], p5 = below[x + 1];
+            const int p6 = below[x], p7 = below[x - 1], p8 = current[x - 1], p9 = above[x - 1];
+            const int n = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+            if (n < 2 || n > 6) continue;
+            const int transitions = (!p2 && p3) + (!p3 && p4) + (!p4 && p5) +
+                                    (!p5 && p6) + (!p6 && p7) + (!p7 && p8) +
+                                    (!p8 && p9) + (!p9 && p2);
+            if (transitions != 1) continue;
+            const bool protect_a = pass == 0 ? p2 * p4 * p6 : p2 * p4 * p8;
+            const bool protect_b = pass == 0 ? p4 * p6 * p8 : p2 * p6 * p8;
+            if (!protect_a && !protect_b) out[x] = 1;
+          }
         }
-      }
-      changed += cv::countNonZero(marker);
-      binary.setTo(0, marker);
+      });
+      changed += cv::countNonZero(work_marker);
+      work_binary.setTo(0, work_marker);
     }
     if (!changed) break;
   }
@@ -603,15 +606,55 @@ RoadDetector::RoadDetector(Config config) : config_(std::move(config)) {
   roi_polygon_.reserve(used.size());
   for (const cv::Point2f& point : used)
     roi_polygon_.emplace_back(point.x / sx, point.y / sy);
+
+  const HsvRange& hsv = config_.road_hsv;
+  for (int h = 0; h < 180; ++h)
+    hsv_lut_.hue[h] = hsv.h_min <= hsv.h_max ? (h >= hsv.h_min && h <= hsv.h_max)
+                                             : (h >= hsv.h_min || h <= hsv.h_max);
+  for (int s = 0; s < 256; ++s)
+    hsv_lut_.saturation[s] = s >= hsv.s_min && s <= hsv.s_max;
+  for (int v = 0; v < 256; ++v)
+    hsv_lut_.value[v] = v >= hsv.v_min && v <= hsv.v_max;
 }
 
-cv::Mat RoadDetector::segment(const cv::Mat& bgr) const {
-  cv::Mat small, view, hsv;
-  cv::resize(bgr, small, cv::Size(config_.process_width, config_.processHeight()));
+cv::Mat RoadDetector::keepBottomConnected(const cv::Mat& mask) const {
+  const int count = cv::connectedComponentsWithStats(mask, labels_scratch_, stats_scratch_,
+                                                     centroids_scratch_, 8);
+  int best = -1;
+  seed_counts_scratch_.assign(static_cast<std::size_t>(count), 0);
+  const int y_start = mask.rows * 4 / 5;
+  const int x0 = mask.cols / 3;
+  const int x1 = mask.cols * 2 / 3;
+  for (int y = y_start; y < mask.rows; ++y) {
+    const int* labels_row = labels_scratch_.ptr<int>(y);
+    for (int x = x0; x < x1; ++x) ++seed_counts_scratch_[labels_row[x]];
+  }
+  int best_seeds = 0;
+  for (int label = 1; label < count; ++label) {
+    const int area = stats_scratch_.at<int>(label, cv::CC_STAT_AREA);
+    if (seed_counts_scratch_[label] > best_seeds &&
+        area > static_cast<int>(mask.total() / 500)) {
+      best = label;
+      best_seeds = seed_counts_scratch_[label];
+    }
+  }
+  cv::Mat& selected = connected_scratch_;
+  selected.create(mask.size(), CV_8UC1);
+  if (best > 0) cv::inRange(labels_scratch_, cv::Scalar(best), cv::Scalar(best), selected);
+  else selected.setTo(0);
+  return selected;
+}
+
+void RoadDetector::prepareView(const cv::Mat& bgr, cv::Mat& processed, cv::Mat& view) const {
+  cv::resize(bgr, processed, cv::Size(config_.process_width, config_.processHeight()));
   if (config_.use_perspective)
-    cv::warpPerspective(small, view, warp_, small.size(), cv::INTER_LINEAR,
+    cv::warpPerspective(processed, view, warp_, processed.size(), cv::INTER_LINEAR,
                         cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-  else view = small;
+  else view = processed;
+}
+
+cv::Mat RoadDetector::segment(const cv::Mat& view) const {
+  cv::Mat hsv;
   cv::cvtColor(view, hsv, cv::COLOR_BGR2HSV);
   if (config_.equalize_value) {
     std::vector<cv::Mat> channels;
@@ -626,37 +669,53 @@ cv::Mat RoadDetector::segment(const cv::Mat& bgr) const {
   const cv::Rect road_seed(w * 44 / 100, h * 36 / 100, w * 12 / 100, h * 14 / 100);
   const cv::Rect left_seed(w * 2 / 100, h * 36 / 100, w * 8 / 100, h * 14 / 100);
   const cv::Rect right_seed(w * 90 / 100, h * 36 / 100, w * 8 / 100, h * 14 / 100);
-  const cv::Scalar road = medianHsv(hsv, road_seed);
-  const cv::Scalar left = medianHsv(hsv, left_seed);
-  const cv::Scalar right = medianHsv(hsv, right_seed);
+  const cv::Scalar road = medianHsv(hsv, road_seed, median_scratch_.channels);
+  const cv::Scalar left = medianHsv(hsv, left_seed, median_scratch_.channels);
+  const cv::Scalar right = medianHsv(hsv, right_seed, median_scratch_.channels);
   cv::Mat smoothed;
   cv::GaussianBlur(view, smoothed, cv::Size(15, 7), 0);
   const cv::Rect& roi = roi_processed_;
-  cv::Mat candidates = cv::Mat::zeros(hsv.size(), CV_8UC1);
-  for (int y = roi.y; y < std::min(h, roi.y + roi.height); ++y) {
-    const auto* pixels = hsv.ptr<cv::Vec3b>(y);
-    const auto* colors = smoothed.ptr<cv::Vec3b>(y);
-    auto* row = candidates.ptr<uchar>(y);
-    const auto cool = [&](int x) { return static_cast<float>(colors[x][0]) - colors[x][2]; };
-    const float outer = std::min(cool(std::clamp(w / 16, 0, w - 1)),
-                                 cool(std::clamp(w * 15 / 16, 0, w - 1)));
-    float road_cool = -255.0f;
-    for (int x = w * 45 / 100; x < w * 55 / 100; x += 3)
-      road_cool = std::max(road_cool, cool(x));
-    const float cool_threshold = outer + config_.chroma_row_ratio * (road_cool - outer);
-    for (int x = roi.x; x < std::min(w, roi.x + roi.width); ++x) {
-      const cv::Vec3b p = pixels[x];
-      if (!withinHsv(p, config_.road_hsv)) continue;
-      const float dr = hsvDistance(p, road);
-      const float db = std::min(hsvDistance(p, left), hsvDistance(p, right));
-      const bool hsv_match = dr <= config_.color_distance_max &&
-                             dr <= db * config_.color_background_ratio;
-      const bool chroma_match = road_cool > outer + config_.chroma_min_contrast &&
-                                cool(x) >= cool_threshold;
-      if (hsv_match || chroma_match)
-        row[x] = 255;
+  cv::Mat& candidates = candidates_scratch_;
+  candidates.create(hsv.size(), CV_8UC1);
+  candidates.setTo(0);
+  // The candidate test only compares distances, so it works on squared values
+  // and skips the square roots; the HSV range test is a table lookup.
+  const float max_distance_squared = config_.color_distance_max * config_.color_distance_max;
+  const float background_ratio_squared =
+      config_.color_background_ratio * config_.color_background_ratio;
+  const float chroma_row_ratio = config_.chroma_row_ratio;
+  const float chroma_min_contrast = config_.chroma_min_contrast;
+  const HsvLut& lut = hsv_lut_;
+  const int x_begin = std::max(0, roi.x);
+  const int x_end = std::min(w, roi.x + roi.width);
+  const int y_end = std::min(h, roi.y + roi.height);
+  // Rows are independent (each row only writes its own output row), so the scan
+  // can use the thread pool without changing the result.
+  cv::parallel_for_(cv::Range(std::max(0, roi.y), y_end), [&](const cv::Range& range) {
+    for (int y = range.start; y < range.end; ++y) {
+      const auto* pixels = hsv.ptr<cv::Vec3b>(y);
+      const auto* colors = smoothed.ptr<cv::Vec3b>(y);
+      auto* row = candidates.ptr<uchar>(y);
+      const auto cool = [&](int x) { return static_cast<float>(colors[x][0]) - colors[x][2]; };
+      const float outer = std::min(cool(std::clamp(w / 16, 0, w - 1)),
+                                   cool(std::clamp(w * 15 / 16, 0, w - 1)));
+      float road_cool = -255.0f;
+      for (int x = w * 45 / 100; x < w * 55 / 100; x += 3)
+        road_cool = std::max(road_cool, cool(x));
+      const float cool_threshold = outer + chroma_row_ratio * (road_cool - outer);
+      const bool chroma_row = road_cool > outer + chroma_min_contrast;
+      for (int x = x_begin; x < x_end; ++x) {
+        const cv::Vec3b p = pixels[x];
+        if (!lut.within(p)) continue;
+        const float dr = hsvDistanceSquared(p, road);
+        const float db = std::min(hsvDistanceSquared(p, left), hsvDistanceSquared(p, right));
+        const bool hsv_match = dr <= max_distance_squared && dr <= db * background_ratio_squared;
+        const bool chroma_match = chroma_row && cool(x) >= cool_threshold;
+        if (hsv_match || chroma_match)
+          row[x] = 255;
+      }
     }
-  }
+  });
   const int k = config_.morphology_pixels | 1;
   cv::morphologyEx(candidates, candidates, cv::MORPH_OPEN,
                    cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k, k)));
@@ -684,14 +743,10 @@ RoadResult RoadDetector::process(const cv::Mat& bgr, std::int64_t timestamp_ms) 
       bgr.rows != config_.input_height)
     throw std::invalid_argument("expected 1280x720 CV_8UC3 BGR frame (or configured input size)");
   const float previous_center = previous_center_x_;
-  RoadResult result = analyzeMask(segment(bgr), timestamp_ms);
-  result.roi_polygon = roi_polygon_;
   cv::Mat processed, view;
-  cv::resize(bgr, processed, cv::Size(config_.process_width, config_.processHeight()));
-  if (config_.use_perspective)
-    cv::warpPerspective(processed, view, warp_, processed.size(), cv::INTER_LINEAR,
-                        cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-  else view = processed;
+  prepareView(bgr, processed, view);
+  RoadResult result = analyzeMask(segment(view), timestamp_ms);
+  result.roi_polygon = roi_polygon_;
   if (result.type == RoadType::STRAIGHT || result.type == RoadType::UNKNOWN) {
     if (!refineWithEdges(view, result)) {
       previous_center_x_ = previous_center;
@@ -747,7 +802,8 @@ bool RoadDetector::refineWithEdges(const cv::Mat& image, RoadResult& result) {
   cv::cvtColor(smooth, hsv, cv::COLOR_BGR2HSV);
   const int w = image.cols, h = image.rows;
   const cv::Scalar road_model = medianHsv(hsv, cv::Rect(w * 44 / 100, h * 36 / 100,
-                                                       w * 12 / 100, h * 14 / 100));
+                                                       w * 12 / 100, h * 14 / 100),
+                                         median_scratch_.channels);
   const cv::Rect& roi = roi_processed_;
   const int first_y = std::max(static_cast<int>(h * 0.17f), roi.y + 5);
   const int last_y = std::min(h - 15, roi.y + roi.height - 5);
@@ -763,7 +819,7 @@ bool RoadDetector::refineWithEdges(const cv::Mat& image, RoadResult& result) {
     if (side == 1) {
       const cv::Vec3b inner = hsv.at<cv::Vec3b>(y, x - 12);
       const cv::Vec3b outer = hsv.at<cv::Vec3b>(y, x + 12);
-      if (!withinHsv(inner, config_.road_hsv)) return -1000.0f;
+      if (!hsv_lut_.within(inner)) return -1000.0f;
       score += std::clamp(0.12f * (hsvDistance(outer, road_model) -
                                     hsvDistance(inner, road_model)), -2.0f, 2.0f);
     }

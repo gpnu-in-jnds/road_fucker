@@ -3,6 +3,7 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -26,56 +27,79 @@ const char* roadCondition(const RoadResult& result) {
   return "UNKNOWN";
 }
 
-cv::Mat draw(const cv::Mat& frame, const RoadResult& result, bool show_fps, double fps) {
-  cv::Mat output = frame.clone();
+// Draws into a caller-owned canvas so a streaming preview does not allocate a
+// full frame every iteration. All geometry is scaled by canvas/frame so a
+// downscaled preview keeps the same layout.
+void drawInto(const cv::Mat& frame, const RoadResult& result, bool show_fps, double fps,
+              double scale, cv::Mat& canvas) {
+  if (scale >= 1.0) {
+    frame.copyTo(canvas);
+  } else {
+    cv::resize(frame, canvas,
+               cv::Size(std::max(1, cvRound(frame.cols * scale)),
+                        std::max(1, cvRound(frame.rows * scale))),
+               0, 0, cv::INTER_AREA);
+  }
+  const double s = static_cast<double>(canvas.cols) / std::max(1, frame.cols);
+  const auto at = [s](int x, int y) { return cv::Point(cvRound(x * s), cvRound(y * s)); };
+  const double font = std::max(0.4, 0.7 * s);
+  const int text_thickness = std::max(1, cvRound(2 * s));
+  const int line_thickness = std::max(1, cvRound(3 * s));
+
   const int panel_height = show_fps ? 120 : 88;
-  const cv::Rect panel(12, 12, 440, panel_height);
-  cv::Mat panel_pixels = output(panel);
-  cv::Mat black(panel.size(), output.type(), cv::Scalar::all(0));
+  const cv::Rect panel(cvRound(12 * s), cvRound(12 * s), cvRound(440 * s),
+                       cvRound(panel_height * s));
+  cv::Mat panel_pixels = canvas(panel);
+  cv::Mat black(panel.size(), canvas.type(), cv::Scalar::all(0));
   cv::addWeighted(panel_pixels, 0.4, black, 0.6, 0.0, panel_pixels);
   const cv::Scalar white(255, 255, 255);
-  cv::putText(output, std::string("ROAD: ") + roadCondition(result), {24, 43},
-              cv::FONT_HERSHEY_SIMPLEX, 0.7, white, 2, cv::LINE_AA);
+  cv::putText(canvas, std::string("ROAD: ") + roadCondition(result), at(24, 43),
+              cv::FONT_HERSHEY_SIMPLEX, font, white, text_thickness, cv::LINE_AA);
   const std::string confidence = result.valid ? cv::format("%.2f", result.confidence) : "--";
-  cv::putText(output, "CONFIDENCE: " + confidence, {24, 76},
-              cv::FONT_HERSHEY_SIMPLEX, 0.7, white, 2, cv::LINE_AA);
+  cv::putText(canvas, "CONFIDENCE: " + confidence, at(24, 76), cv::FONT_HERSHEY_SIMPLEX, font,
+              white, text_thickness, cv::LINE_AA);
   if (show_fps) {
     const std::string label = fps < 0.0 ? "MEASURING" : cv::format("%.1f", fps);
-    cv::putText(output, "FPS: " + label, {24, 109},
-                cv::FONT_HERSHEY_SIMPLEX, 0.7, white, 2, cv::LINE_AA);
+    cv::putText(canvas, "FPS: " + label, at(24, 109), cv::FONT_HERSHEY_SIMPLEX, font, white,
+                text_thickness, cv::LINE_AA);
   }
   // Detection window actually used for this frame, in input-image pixels.
   if (result.roi_polygon.size() == 4) {
     std::vector<cv::Point> window;
     window.reserve(result.roi_polygon.size());
     for (const cv::Point2f& point : result.roi_polygon)
-      window.emplace_back(cvRound(point.x), cvRound(point.y));
-    cv::polylines(output, std::vector<std::vector<cv::Point>>{window}, /*isClosed=*/true,
+      window.emplace_back(cvRound(point.x * s), cvRound(point.y * s));
+    cv::polylines(canvas, std::vector<std::vector<cv::Point>>{window}, /*isClosed=*/true,
                   cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
   }
   const auto draw_line = [&](const std::vector<cv::Point2f>& points, const cv::Scalar& color) {
     for (std::size_t i = 1; i < points.size(); ++i)
-      cv::line(output, points[i - 1], points[i], color, 3, cv::LINE_AA);
+      cv::line(canvas, at(cvRound(points[i - 1].x), cvRound(points[i - 1].y)),
+               at(cvRound(points[i].x), cvRound(points[i].y)), color, line_thickness, cv::LINE_AA);
   };
   if (result.valid) {
     draw_line(result.left_boundary, {255, 255, 0});  // Cyan in BGR.
     draw_line(result.right_boundary, {0, 165, 255}); // Orange in BGR.
     draw_line(result.centerline, {0, 255, 0});
   }
-  return output;
 }
 
 }  // namespace
 
 cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result) {
-  return draw(frame, result, false, -1.0);
+  cv::Mat output;
+  drawInto(frame, result, false, -1.0, 1.0, output);
+  return output;
 }
 
-Preview::Preview(cv::Size image_size) {
+Preview::Preview(cv::Size image_size, double scale, double refresh_hz)
+    : scale_(scale > 0.0 ? scale : 1.0), refresh_hz_(refresh_hz > 0.0 ? refresh_hz : 0.0) {
+  const cv::Size window_size(std::max(1, cvRound(image_size.width * scale_)),
+                             std::max(1, cvRound(image_size.height * scale_)));
   try {
     cv::namedWindow(kPreviewWindow, cv::WINDOW_NORMAL | cv::WINDOW_KEEPRATIO |
                                        cv::WINDOW_GUI_NORMAL);
-    cv::resizeWindow(kPreviewWindow, image_size);
+    cv::resizeWindow(kPreviewWindow, window_size);
   } catch (const cv::Exception& error) {
     throw std::runtime_error(
         std::string("cannot create the preview window: ") + error.what() +
@@ -94,8 +118,21 @@ void Preview::frameCompleted() {
   }
 }
 
+bool Preview::refreshDue(bool forced) const {
+  if (forced || refresh_hz_ <= 0.0 || !drawn_once_) return true;
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - last_draw_).count();
+  return elapsed_ms >= 1000.0 / refresh_hz_;
+}
+
 bool Preview::show(const cv::Mat& frame, const RoadResult& result, int wait_ms) {
-  cv::imshow(kPreviewWindow, draw(frame, result, true, fps_));
+  // wait_ms == 0 means a single image is on screen and must be drawn once.
+  if (refreshDue(wait_ms <= 0)) {
+    drawInto(frame, result, true, fps_, scale_, canvas_);
+    cv::imshow(kPreviewWindow, canvas_);
+    last_draw_ = std::chrono::steady_clock::now();
+    drawn_once_ = true;
+  }
   const int key = cv::waitKey(wait_ms);
   frameCompleted();
   if (key == 27 || key == 'q' || key == 'Q') {

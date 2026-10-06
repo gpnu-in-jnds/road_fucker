@@ -67,8 +67,13 @@ cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result);
 // Owns the preview window: creation, drawing, event loop and close detection.
 class Preview {
  public:
+  // image_size is the size of the frames handed to show(). scale shrinks the
+  // preview and the window: the OpenCV GTK backend converts every displayed
+  // frame to RGB in software and blits it with cairo, so on a weak SoC a smaller
+  // preview is much cheaper. refresh_hz > 0 limits how often the window is
+  // redrawn while detection keeps running on every frame (0 = every frame).
   // Throws when the window cannot be created (no display, no GUI backend).
-  explicit Preview(cv::Size image_size);
+  Preview(cv::Size image_size, double scale = 1.0, double refresh_hz = 0.0);
 
   // Draws one frame and pumps the GUI event loop. wait_ms is passed to
   // cv::waitKey: 1 while streaming, 0 to block on a single image. Returns false
@@ -79,10 +84,16 @@ class Preview {
 
  private:
   void frameCompleted();
+  bool refreshDue(bool forced) const;
 
   PreviewWindowState state_;
   bool unusable_visibility_reported_ = false;
   std::string stop_reason_;
+  cv::Mat canvas_;
+  double scale_ = 1.0;
+  double refresh_hz_ = 0.0;
+  std::chrono::steady_clock::time_point last_draw_{};
+  bool drawn_once_ = false;
   std::chrono::steady_clock::time_point fps_window_start_ = std::chrono::steady_clock::now();
   int fps_frames_ = 0;
   double fps_ = -1.0;

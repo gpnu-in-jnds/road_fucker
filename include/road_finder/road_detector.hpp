@@ -103,6 +103,21 @@ class RoadDetector {
   const std::vector<cv::Point2f>& roiPolygon() const { return roi_polygon_; }
 
  private:
+  // Table-driven form of withinHsv(): the per-pixel range test dominates the
+  // candidate scan, so the three range checks become array lookups.
+  struct HsvLut {
+    std::array<bool, 180> hue{};
+    std::array<bool, 256> saturation{};
+    std::array<bool, 256> value{};
+    bool within(const cv::Vec3b& pixel) const {
+      return saturation[pixel[1]] && value[pixel[2]] && (pixel[1] < 15 || hue[pixel[0]]);
+    }
+  };
+  // Reused per-frame scratch so a frame does not allocate buffers of its own.
+  struct MedianScratch {
+    std::array<std::vector<int>, 3> channels;
+  };
+
   Config config_;
   cv::Mat warp_;
   cv::Mat inverse_warp_;
@@ -111,7 +126,21 @@ class RoadDetector {
   std::vector<RoadType> recent_types_;
   float previous_center_x_ = -1.0f;
   float vehicle_x_ = -1.0f;
-  cv::Mat segment(const cv::Mat& bgr) const;
+  HsvLut hsv_lut_;
+  mutable MedianScratch median_scratch_;
+  mutable cv::Mat candidates_scratch_;
+  mutable cv::Mat labels_scratch_;
+  mutable cv::Mat stats_scratch_;
+  mutable cv::Mat centroids_scratch_;
+  mutable cv::Mat connected_scratch_;
+  mutable std::vector<int> seed_counts_scratch_;
+
+  // Resizes once and applies the optional perspective warp once; both the
+  // segmentation and the edge refinement work on the returned view.
+  void prepareView(const cv::Mat& bgr, cv::Mat& processed, cv::Mat& view) const;
+  cv::Mat segment(const cv::Mat& view) const;
+  // Keeps only the road component that is seeded from the bottom of the image.
+  cv::Mat keepBottomConnected(const cv::Mat& mask) const;
   RoadResult analyzeMask(const cv::Mat& mask, std::int64_t timestamp_ms);
   bool refineWithEdges(const cv::Mat& processed_bgr, RoadResult& result);
   RoadType stabilize(RoadType current);
