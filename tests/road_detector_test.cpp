@@ -302,6 +302,84 @@ void expectWideJunctions() {
   }
 }
 
+void expectForwardContinuationNotTurn() {
+  auto config = testConfig();
+  config.segmentation_mode = "adaptive_dark";
+  road_finder::RoadDetector detector(config);
+  for (bool mirror : {false, true}) {
+    for (int shape : {0, 1, 2}) {
+      cv::Mat road = cv::Mat::zeros(360, 640, CV_8UC1);
+      // A continuous lane can be off axis or flare toward the horizon.
+      // Neither changes its topology into a 90-degree lateral exit.
+      const int top_left = shape == 2 ? 497 : (shape == 1 ? 390 : 360);
+      const int top_right = shape == 2 ? 503 : (shape == 1 ? 610 : 440);
+      cv::fillConvexPoly(road, std::vector<cv::Point>{
+          {280, 359}, {360, 359}, {top_right, 0}, {top_left, 0}}, cv::Scalar(255));
+      if (mirror) cv::flip(road, road, 1);
+      const auto result = detector.processMask(road, 100);
+      require(result.valid && result.type == road_finder::RoadType::STRAIGHT &&
+                  result.available_directions == road_finder::STRAIGHT,
+              "an off-axis forward lane reaching the image top must not become a turn");
+    }
+  }
+}
+
+void expectVeryCloseTJunctionEvidence() {
+  auto config = testConfig();
+  config.segmentation_mode = "adaptive_dark";
+  road_finder::RoadDetector detector(config);
+  const cv::Mat very_close = wideJunction(35, 350, 220);
+  const auto near_result = detector.processMask(very_close, 100);
+  require(near_result.type == road_finder::RoadType::T_JUNCTION,
+          "a T with entrance edges visible only in the last image rows should be classified");
+  require(!near_result.valid && near_result.centerline.empty(),
+          "a short visible entrance must not create unmeasured steering geometry");
+
+  for (bool mirror : {false, true}) {
+    cv::Mat fringe = wideJunction(35, 245, 80);
+    cv::rectangle(fringe, {4, 0}, {9, 35}, cv::Scalar(255), cv::FILLED);
+    if (mirror) cv::flip(fringe, fringe, 1);
+    require(detector.processMask(fringe, 101).type == road_finder::RoadType::T_JUNCTION,
+            "a thin connected edge artifact above a T must not count as a forward road");
+
+    cv::Mat close_turn = cv::Mat::zeros(360, 640, CV_8UC1);
+    cv::rectangle(close_turn, {120, 350}, {520, 359}, cv::Scalar(255), cv::FILLED);
+    cv::rectangle(close_turn, {mirror ? 0 : 120, 35}, {mirror ? 520 : 639, 350},
+                   cv::Scalar(255), cv::FILLED);
+    require(detector.processMask(close_turn, 102).type ==
+                (mirror ? road_finder::RoadType::LEFT_TURN
+                        : road_finder::RoadType::RIGHT_TURN),
+            "a short entrance with only one arm must remain a one-sided turn");
+  }
+
+  cv::Mat no_entrance(360, 640, CV_8UC1, cv::Scalar(255));
+  cv::rectangle(no_entrance, {0, 0}, {639, 34}, cv::Scalar(0), cv::FILLED);
+  require(detector.processMask(no_entrance, 103).type == road_finder::RoadType::UNKNOWN,
+          "a full-width patch without measured entrance edges must remain unknown");
+  cv::Mat clipped = wideJunction(35, 350, 220);
+  cv::rectangle(clipped, {0, 350}, {520, 359}, cv::Scalar(255), cv::FILLED);
+  require(detector.processMask(clipped, 104).type == road_finder::RoadType::UNKNOWN,
+          "one missing entrance boundary must not be invented for a close T");
+
+  cv::Mat cross = wideJunction(100, 230, 80);
+  cv::fillConvexPoly(cross, std::vector<cv::Point>{
+      {240, 100}, {400, 100}, {323, 0}, {317, 0}}, cv::Scalar(255));
+  require(detector.processMask(cross, 105).type != road_finder::RoadType::T_JUNCTION,
+          "a tapering real forward exit must not be removed as an edge artifact");
+
+  config.process_width = 320;
+  road_finder::RoadDetector smaller(config);
+  cv::Mat fringe = wideJunction(35, 245, 80);
+  cv::rectangle(fringe, {4, 0}, {9, 35}, cv::Scalar(255), cv::FILLED);
+  for (const cv::Mat& image : {very_close, fringe}) {
+    cv::Mat resized;
+    cv::resize(image, resized, cv::Size(config.process_width, config.processHeight()),
+                0, 0, cv::INTER_NEAREST);
+    require(smaller.processMask(resized, 106).type == road_finder::RoadType::T_JUNCTION,
+            "close-entry and fringe handling must also work at 320 processing width");
+  }
+}
+
 void expectAsymmetricCloseJunctions() {
   auto config = testConfig();
   config.segmentation_mode = "adaptive_dark";
@@ -490,6 +568,8 @@ int main() {
     expectDistractorsRejected();
     expectAdaptiveDarkRoad();
     expectWideJunctions();
+    expectForwardContinuationNotTurn();
+    expectVeryCloseTJunctionEvidence();
     expectAsymmetricCloseJunctions();
     expectJunctionColorUnderUnevenLight();
     expectCapturedCloseTJunction();

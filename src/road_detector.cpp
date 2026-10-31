@@ -382,6 +382,8 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
 
   struct Span { int left = 0; int right = -1; int width() const { return right - left + 1; } };
   std::vector<Span> profile(mask.rows);
+  std::vector<bool> connected_rows(mask.rows, false);
+  std::vector<int> connected_widths(mask.rows, 0);
   const int center = cvRound(centroids.at<double>(best, 0));
   for (int y = 0; y < mask.rows; ++y) {
     const int* row = labels.ptr<int>(y);
@@ -391,6 +393,8 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
       if (row[x] != best) { ++x; continue; }
       const int left = x;
       while (x < roi.x + roi.width && row[x] == best) ++x;
+      connected_rows[y] = true;
+      connected_widths[y] = std::max(connected_widths[y], x - left);
       const int distance = center < left ? left - center : std::max(0, center - x + 1);
       if (distance < nearest) {
         nearest = distance;
@@ -401,15 +405,32 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
   }
 
   std::vector<int> lefts, rights;
-  for (int y = mask.rows * 85 / 100; y < mask.rows * 97 / 100; ++y) {
+  const auto append_neck = [&](int y) {
     const Span& span = profile[y];
     if (span.width() < mask.cols * 0.06 || span.left <= roi.x + 1 ||
         span.right >= roi.x + roi.width - 2)
-      continue;
+      return false;
     lefts.push_back(span.left);
     rights.push_back(span.right);
+    return true;
+  };
+  for (int y = mask.rows * 85 / 100; y < mask.rows * 97 / 100; ++y)
+    append_neck(y);
+  if (lefts.size() < static_cast<std::size_t>(std::max(3, mask.rows / 30))) {
+    // Very close to a junction, both incoming edges may only enter the last
+    // image rows. Require a contiguous measured run rather than invent edges
+    // from a full-width patch or a single clipped boundary.
+    lefts.clear();
+    rights.clear();
+    const int minimum_close_rows = std::max(3, mask.rows / 60);
+    for (int y = mask.rows - 1; y >= mask.rows * 85 / 100; --y) {
+      if (append_neck(y)) continue;
+      if (lefts.size() >= static_cast<std::size_t>(minimum_close_rows)) break;
+      lefts.clear();
+      rights.clear();
+    }
+    if (lefts.size() < static_cast<std::size_t>(minimum_close_rows)) return {};
   }
-  if (lefts.size() < static_cast<std::size_t>(std::max(3, mask.rows / 30))) return {};
   std::sort(lefts.begin(), lefts.end());
   std::sort(rights.begin(), rights.end());
   const int neck_left = lefts[lefts.size() / 2];
@@ -423,10 +444,12 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
   const int right_opening = std::min(opening, std::max(2, (right_margin + 1) / 2));
   const int minimum_bar_height = std::max(3, mask.rows / 20);
   const int probe = std::max(3, mask.rows / 20);
+  const int minimum_forward_width =
+      std::max(3, std::min(neck_width / 5, cvRound(mask.cols * 0.02)));
   const int neck_center = (neck_left + neck_right) / 2;
   int left_run = 0, right_run = 0, both_run = 0;
   int max_left = 0, max_right = 0, max_both = 0;
-  int since_branch = 0, closed_rows = 0;
+  int narrow_forward_rows = 0, closed_rows = 0, t_closed_rows = 0;
   for (int y = mask.rows * 85 / 100; y >= 0; --y) {
     const Span& span = profile[y];
     const bool left = span.width() > 0 && span.left <= neck_left - left_opening;
@@ -439,27 +462,36 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
     max_left = std::max(max_left, left_run);
     max_right = std::max(max_right, right_run);
     max_both = std::max(max_both, both_run);
-    since_branch = forward && (left || right) ? 0 : since_branch + 1;
-    closed_rows = forward ? 0 : closed_rows + 1;
-    if (closed_rows >= probe && since_branch <= probe * 2) {
+    // Leaving the bottom stem's fixed x coordinate is not a blocked road.
+    // A slanted or flared forward lane may still continue elsewhere in the
+    // same connected component, all the way to the top of the image.
+    closed_rows = connected_rows[y] ? 0 : closed_rows + 1;
+    // A very thin connected streak is not a measurable forward road. This
+    // relaxed closure is T-only: a one-sided turn still needs complete
+    // closure so a tapering/slanted forward lane cannot become LEFT/RIGHT.
+    t_closed_rows = connected_widths[y] < minimum_forward_width ? t_closed_rows + 1 : 0;
+    narrow_forward_rows = forward && !left && !right ? narrow_forward_rows + 1 : 0;
+    if (narrow_forward_rows >= probe) max_left = max_right = max_both = 0;
+    if (closed_rows >= probe || t_closed_rows >= probe) {
       // Remember both exits across a slanted top edge, rather than allowing
       // the last remaining side of that edge to overwrite the T classification.
       RoadType type = RoadType::UNKNOWN;
       int evidence = 0;
-      if (max_both >= minimum_bar_height) {
+      if (t_closed_rows >= probe && max_both >= minimum_bar_height) {
         type = RoadType::T_JUNCTION;
         evidence = max_both;
-      } else if (max_left >= minimum_bar_height && max_right < minimum_bar_height) {
+      } else if (closed_rows >= probe &&
+                 max_left >= minimum_bar_height && max_right < minimum_bar_height) {
         type = RoadType::LEFT_TURN;
         evidence = max_left;
-      } else if (max_right >= minimum_bar_height && max_left < minimum_bar_height) {
+      } else if (closed_rows >= probe &&
+                 max_right >= minimum_bar_height && max_left < minimum_bar_height) {
         type = RoadType::RIGHT_TURN;
         evidence = max_right;
       }
       if (type != RoadType::UNKNOWN)
         return {type, std::min(0.95f, 0.75f + 0.2f * evidence / (2.0f * minimum_bar_height))};
     }
-    if (since_branch > probe * 2) max_left = max_right = max_both = 0;
   }
   return {};
 }
