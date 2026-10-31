@@ -82,6 +82,12 @@ class Preview {
 
   const std::string& stopReason() const { return stop_reason_; }
 
+  bool takeSnapshotRequest() {
+    const bool requested = snapshot_requested_;
+    snapshot_requested_ = false;
+    return requested;
+  }
+
  private:
   void frameCompleted();
   bool refreshDue(bool forced) const;
@@ -94,6 +100,7 @@ class Preview {
   double refresh_hz_ = 0.0;
   std::chrono::steady_clock::time_point last_draw_{};
   bool drawn_once_ = false;
+  bool snapshot_requested_ = false;
   std::chrono::steady_clock::time_point fps_window_start_ = std::chrono::steady_clock::now();
   int fps_frames_ = 0;
   double fps_ = -1.0;

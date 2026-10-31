@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(road_finder LANGUAGES CXX)
+project(road_fucker LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,35 +12,45 @@ if(NOT OpenCV_FOUND)
   find_package(OpenCV 5 REQUIRED COMPONENTS core geometry imgproc videoio highgui imgcodecs)
 endif()
 
-add_library(road_finder_lib src/road_detector.cpp src/camera.cpp src/preview.cpp)
-target_include_directories(road_finder_lib PUBLIC include ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(road_finder_lib PUBLIC ${OpenCV_LIBS})
-target_compile_options(road_finder_lib PRIVATE -Wall -Wextra -Wpedantic)
+add_library(road_fucker_lib
+    src/road_detector.cpp
+    src/camera.cpp
+    src/preview.cpp
+    src/uart_sender.cpp)
+target_include_directories(road_fucker_lib PUBLIC include ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(road_fucker_lib PUBLIC ${OpenCV_LIBS})
+target_compile_options(road_fucker_lib PRIVATE -Wall -Wextra -Wpedantic)
 
-add_executable(road_finder src/main.cpp)
-target_link_libraries(road_finder PRIVATE road_finder_lib)
-target_compile_options(road_finder PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(road_fucker src/main.cpp)
+target_link_libraries(road_fucker PRIVATE road_fucker_lib)
+target_compile_options(road_fucker PRIVATE -Wall -Wextra -Wpedantic)
 
 include(CTest)
 if(BUILD_TESTING)
-  add_executable(road_finder_tests tests/road_detector_test.cpp)
-  target_link_libraries(road_finder_tests PRIVATE road_finder_lib)
-  target_compile_definitions(road_finder_tests PRIVATE
-    ROAD_FINDER_SAMPLE_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/frame_784.png")
-  add_test(NAME road_finder_tests COMMAND road_finder_tests)
+  add_executable(road_fucker_tests tests/road_detector_test.cpp)
+  target_link_libraries(road_fucker_tests PRIVATE road_fucker_lib)
+  target_compile_definitions(road_fucker_tests PRIVATE
+    ROAD_FUCKER_SAMPLE_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/frame_784.png"
+    ROAD_FUCKER_CLOSE_T_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/t_junction_close.png")
+  add_test(NAME road_fucker_tests COMMAND road_fucker_tests)
 
-  add_executable(road_finder_preview_tests tests/preview_window_test.cpp)
-  target_link_libraries(road_finder_preview_tests PRIVATE road_finder_lib)
-  target_compile_options(road_finder_preview_tests PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME road_finder_preview_tests COMMAND road_finder_preview_tests)
+  add_executable(road_fucker_preview_tests tests/preview_window_test.cpp)
+  target_link_libraries(road_fucker_preview_tests PRIVATE road_fucker_lib)
+  target_compile_options(road_fucker_preview_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME road_fucker_preview_tests COMMAND road_fucker_preview_tests)
 
-  add_executable(road_finder_source_tests tests/source_test.cpp)
-  target_link_libraries(road_finder_source_tests PRIVATE road_finder_lib)
-  target_compile_options(road_finder_source_tests PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME road_finder_source_tests COMMAND road_finder_source_tests)
+  add_executable(road_fucker_source_tests tests/source_test.cpp)
+  target_link_libraries(road_fucker_source_tests PRIVATE road_fucker_lib)
+  target_compile_options(road_fucker_source_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME road_fucker_source_tests COMMAND road_fucker_source_tests)
 
-  add_executable(road_finder_config_tests tests/config_test.cpp)
-  target_link_libraries(road_finder_config_tests PRIVATE road_finder_lib)
-  target_compile_options(road_finder_config_tests PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME road_finder_config_tests COMMAND road_finder_config_tests)
+  add_executable(road_fucker_config_tests tests/config_test.cpp)
+  target_link_libraries(road_fucker_config_tests PRIVATE road_fucker_lib)
+  target_compile_options(road_fucker_config_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME road_fucker_config_tests COMMAND road_fucker_config_tests)
+
+  add_executable(road_fucker_uart_tests tests/uart_packet_test.cpp)
+  target_link_libraries(road_fucker_uart_tests PRIVATE road_fucker_lib)
+  target_compile_options(road_fucker_uart_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME road_fucker_uart_tests COMMAND road_fucker_uart_tests)
 endif()

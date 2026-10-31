@@ -67,6 +67,20 @@ void expectProbeWindow() {
           "enough unusable readings must report the backend as unsupported");
 }
 
+void expectClassificationWithoutGeometry() {
+  cv::Mat frame = cv::Mat::zeros(720, 1280, CV_8UC3);
+  road_finder::RoadResult lost;
+  const cv::Mat lost_view = road_finder::annotateResult(frame, lost);
+  road_finder::RoadResult junction;
+  junction.type = road_finder::RoadType::T_JUNCTION;
+  junction.classification_confidence = 0.9f;
+  const cv::Mat junction_view = road_finder::annotateResult(frame, junction);
+  require(cv::norm(lost_view, junction_view, cv::NORM_L1) > 1000.0,
+          "a recognized junction without geometry must display differently from LOST");
+  require(cv::countNonZero(junction_view(cv::Rect(0, 200, 1280, 520)).reshape(1)) == 0,
+          "classification alone must not draw fabricated lane boundaries");
+}
+
 }  // namespace
 
 int main() {
@@ -77,6 +91,7 @@ int main() {
     expectLateWindowMapping();
     expectVisibleThreshold();
     expectProbeWindow();
+    expectClassificationWithoutGeometry();
     std::cout << "preview window tests passed\n";
     return 0;
   } catch (const std::exception& error) {

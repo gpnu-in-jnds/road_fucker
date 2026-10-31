@@ -1,48 +1,56 @@
 %YAML:1.0
 ---
-# Original frame size: the camera or image must match it. Both the detection
-# window below and the perspective points use this coordinate system.
 input_width: 1280
 input_height: 720
-
-# Processing width only; the height follows the input aspect ratio (640 -> 360).
-# Every pixel-unit threshold (edge_line_residual_px, morphology_pixels, ...) is
-# measured on this processed image.
 process_width: 640
 
-# Detection window: pixel rectangle [x, y, width, height] on the original frame.
-# Read the numbers straight off the preview or an --overlay export: the window is
-# drawn there as a thin yellow outline. It has to reach at least 80% of the image
-# height, because the road profile grows from the bottom of the window.
-# default for reference
-# roi: [26, 86, 1229, 612]
+# Steering search window in original-image pixels. Junction topology searches
+# the same horizontal range over the full image height. Scan bands below use
+# an independent 128x90 reference coordinate system.
 roi: [0, 360, 1280, 360]
 
-# OpenCV HSV: H 0..179, S/V 0..255. Calibrate these from live video.
-# The broad defaults admit grey road pixels while the adaptive road/background
-# models and connected-region checks supply the additional discrimination.
-road_hsv: [0, 179, 0, 70, 35, 220]
-equalize_value: 0
-color_distance_max: 85.0
-color_background_ratio: 1.15
-chroma_row_ratio: 0.20
-chroma_min_contrast: 3.0
-edge_min_score: 3.5
-# Straight-road robust line fit; pixel distances use the 640x360 process image.
-edge_line_residual_px: 8.0
-edge_min_inlier_ratio: 0.48
-edge_min_span_fraction: 0.28
+# Learn road/floor color contrast when available, including reflective roads.
+# Otherwise use row/frame brightness to retain full-width junction crossbars.
+segmentation_mode: adaptive_dark
+road_contrast_min: 18
+min_road_width_fraction: 0.06
+max_road_width_fraction: 0.85
+
+# Video only: confirm a type change over three frames, bridge at most two noisy
+# observations, and smooth consecutive measured geometry. No stale steering.
+classification_confirm_frames: 3
+classification_hold_frames: 2
+geometry_smoothing_alpha: 0.35
+
+# Used only with segmentation_mode: lab. OpenCV 8-bit Lab bounds:
+# [Lmin,Lmax,amin,amax,bmin,bmax].
+road_lab: [133, 171, 124, 148, 123, 138]
 morphology_pixels: 3
-max_white_gap_width_ratio: 0.22
-min_road_width_fraction: 0.08
-max_road_width_fraction: 0.92
-junction_min_arm_widths: 0.65
-junction_vote_frames: 3
-junction_vote_window: 5
-lookahead_fraction: 0.55
-minimum_confidence: 0.38
+min_blob_area_reference: 10
+
+# Sample's six lower-road scan strips, in 128x90 reference pixels.
+scan_bands:
+  - [0, 42, 128, 7]
+  - [0, 49, 128, 7]
+  - [0, 56, 128, 7]
+  - [0, 63, 128, 7]
+  - [0, 70, 128, 7]
+  - [0, 77, 128, 7]
+
+# The top black region gates the left/right white marker checks.
+indicator_roi: [50, 34, 28, 30]
+indicator_min_area_reference: 53
+left_marker_roi: [10, 50, 10, 10]
+right_marker_roi: [108, 50, 10, 10]
+
+# Stop-zone recognition is opt-in. The sample's reversed B bounds are corrected
+# to [-45,-9] before translating to OpenCV's 8-bit Lab coordinates.
+stop_detection_enabled: 0
+stop_roi: [50, 50, 28, 7]
+stop_lab: [51, 135, 149, 193, 83, 119]
+stop_min_area_reference: 53
 
 # Add both point sets to enable a perspective transform. Coordinates use the
-# original 1280x720 image and must be ordered TL, TR, BR, BL. Example:
+# original input frame and must be ordered TL, TR, BR, BL.
 # perspective_src: [[430, 120], [930, 120], [1220, 700], [60, 700]]
 # perspective_dst: [[400, 120], [880, 120], [880, 700], [400, 700]]

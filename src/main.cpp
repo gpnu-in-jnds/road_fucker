@@ -1,6 +1,7 @@
 #include "road_finder/camera.hpp"
 #include "road_finder/preview.hpp"
 #include "road_finder/road_detector.hpp"
+#include "road_finder/uart_sender.hpp"
 
 #include <opencv2/core/utility.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -21,12 +23,14 @@ namespace {
 
 constexpr const char* kDefaultSource = "/dev/video0";
 constexpr const char* kDefaultConfig = "config/road_finder.yaml";
+constexpr const char* kDefaultSerialDevice = "/dev/ttyS0";
 constexpr double kDefaultCameraFps = 30.0;
 
 struct Options {
   std::string source = kDefaultSource;
   std::string config = kDefaultConfig;
   std::string camera_fourcc;
+  std::string serial_device = kDefaultSerialDevice;
   std::string overlay_path;
   std::string mask_path;
   double camera_fps = kDefaultCameraFps;
@@ -36,20 +40,24 @@ struct Options {
   int benchmark_frames = 0;    // > 0 exits after that many frames.
   bool display = true;
   bool json = false;
+  bool serial_enabled = true;
+  bool serial_device_explicit = false;
 };
 
 void usage() {
-  std::cout << "road_finder [--source /dev/video0|0|frame.png] [--config file] [--no-display] "
+  std::cout << "road_fucker [--source /dev/video0|0|frame.png] [--config file] [--no-display] "
                "[--json] [--camera-fourcc MJPG] [--camera-fps 30] [--preview-scale 1.0] "
                "[--preview-fps 0] [--threads N] [--benchmark frames] [--overlay file] "
-               "[--mask file]\n"
+               "[--mask file] [--serial-device /dev/ttyS0|--no-serial]\n"
                "Defaults: --source "
             << kDefaultSource << ", --config " << kDefaultConfig
-            << ", preview window open at full size, no JSON output.\n"
+            << ", preview window open at full size, no JSON output, UART "
+            << kDefaultSerialDevice << " at 115200 8N1 for camera sources.\n"
                "--preview-scale shrinks the preview window (0.5 is much cheaper to draw on "
                "weak GPUs); --preview-fps limits how often it is redrawn (detection keeps "
                "running every frame); --benchmark runs a fixed number of frames and prints "
-               "per-stage timings.\n";
+               "per-stage timings. Press S in the camera preview to save raw/mask/overlay "
+               "images under build/captures/.\n";
 }
 
 double parsePositiveDouble(const std::string& value, const char* flag) {
@@ -97,15 +105,21 @@ Options parse(int argc, char** argv) {
     else if (arg == "--no-display") options.display = false;
     else if (arg == "--json") options.json = true;
     else if (arg == "--no-json") options.json = false;      // Default; kept for old scripts.
+    else if (arg == "--no-serial") options.serial_enabled = false;
     else if (arg == "--source" || arg == "--config" || arg == "--camera-fourcc" ||
              arg == "--camera-fps" || arg == "--preview-scale" || arg == "--preview-fps" ||
              arg == "--threads" || arg == "--benchmark" || arg == "--overlay" ||
-             arg == "--mask") {
+             arg == "--mask" || arg == "--serial-device") {
       if (i + 1 >= argc) throw std::runtime_error("missing value after " + arg);
       const std::string value = argv[++i];
       if (arg == "--source") options.source = value;
       else if (arg == "--config") options.config = value;
       else if (arg == "--camera-fourcc") options.camera_fourcc = value;
+      else if (arg == "--serial-device") {
+        options.serial_device = value;
+        options.serial_device_explicit = true;
+        options.serial_enabled = true;
+      }
       else if (arg == "--camera-fps") options.camera_fps = parsePositiveDouble(value, arg.c_str());
       else if (arg == "--preview-scale") {
         options.preview_scale = parsePositiveDouble(value, arg.c_str());
@@ -139,6 +153,8 @@ void printResult(const road_finder::RoadResult& r) {
             << "{\"timestamp_ms\":" << r.timestamp_ms
             << ",\"valid\":" << (r.valid ? "true" : "false")
             << ",\"type\":\"" << road_finder::toString(r.type) << "\""
+            << ",\"raw_type\":\"" << road_finder::toString(r.raw_type) << "\""
+            << ",\"classification_confidence\":" << r.classification_confidence
             << ",\"directions\":[";
   bool first = true;
   const std::array<std::pair<unsigned, const char*>, 3> directions{{
@@ -232,7 +248,8 @@ std::unique_ptr<road_finder::Preview> makePreview(const Options& options, cv::Si
   return std::make_unique<road_finder::Preview>(size, options.preview_scale, options.preview_fps);
 }
 
-int runImage(const Options& options, road_finder::RoadDetector& detector) {
+int runImage(const Options& options, road_finder::RoadDetector& detector,
+             road_finder::UartSender* serial) {
   const cv::Mat frame = cv::imread(options.source, cv::IMREAD_COLOR);
   if (frame.empty()) throw std::runtime_error("cannot read image: " + options.source);
   const std::unique_ptr<road_finder::Preview> preview = makePreview(options, frame.size());
@@ -243,6 +260,7 @@ int runImage(const Options& options, road_finder::RoadDetector& detector) {
     for (int i = 0; i < options.benchmark_frames; ++i) {
       const auto detect_start = std::chrono::steady_clock::now();
       const road_finder::RoadResult result = detector.process(frame, nowMilliseconds());
+      if (serial) serial->send(result, frame.cols);
       const double detect_ms = elapsedMs(detect_start);
       double preview_ms = 0.0;
       if (preview) {
@@ -256,6 +274,7 @@ int runImage(const Options& options, road_finder::RoadDetector& detector) {
     return 0;
   }
   const road_finder::RoadResult result = detector.process(frame, nowMilliseconds());
+  if (serial) serial->send(result, frame.cols);
   if (options.json) printResult(result);
   if (!options.overlay_path.empty() &&
       !cv::imwrite(options.overlay_path, road_finder::annotateResult(frame, result)))
@@ -266,9 +285,23 @@ int runImage(const Options& options, road_finder::RoadDetector& detector) {
   return 0;
 }
 
+void saveSnapshot(const cv::Mat& frame, const road_finder::RoadResult& result) {
+  const std::filesystem::path directory("build/captures");
+  std::filesystem::create_directories(directory);
+  const std::string prefix = (directory / std::to_string(result.timestamp_ms)).string();
+  if (!cv::imwrite(prefix + "_raw.png", frame) ||
+      !cv::imwrite(prefix + "_mask.png", result.road_mask) ||
+      !cv::imwrite(prefix + "_overlay.png", road_finder::annotateResult(frame, result)))
+    throw std::runtime_error("cannot write snapshot images");
+  std::cerr << "snapshot saved: " << prefix << "_{raw,mask,overlay}.png"
+            << " | type " << road_finder::toString(result.type)
+            << " | raw_type " << road_finder::toString(result.raw_type)
+            << " | geometry " << (result.valid ? "measured" : "unavailable") << '\n';
+}
+
 // The camera stream: read, detect, optionally print JSON, optionally show.
 int runCamera(const Options& options, const road_finder::Config& config,
-              road_finder::RoadDetector& detector) {
+              road_finder::RoadDetector& detector, road_finder::UartSender* serial) {
   road_finder::Camera camera(options.source, {options.camera_fourcc, options.camera_fps}, config);
   const std::unique_ptr<road_finder::Preview> preview =
       makePreview(options, cv::Size(config.input_width, config.input_height));
@@ -281,7 +314,8 @@ int runCamera(const Options& options, const road_finder::Config& config,
     camera.read(frame);
     const double read_ms = elapsedMs(start);
     start = std::chrono::steady_clock::now();
-    const road_finder::RoadResult result = detector.process(frame, nowMilliseconds());
+    const road_finder::RoadResult result = detector.process(frame, nowMilliseconds(), true);
+    if (serial) serial->send(result, config.input_width);
     if (options.json) printResult(result);
     const double detect_ms = elapsedMs(start);
     double preview_ms = 0.0;
@@ -290,6 +324,13 @@ int runCamera(const Options& options, const road_finder::Config& config,
       const bool keep_running = preview->show(frame, result);
       preview_ms = elapsedMs(start);
       if (!keep_running) stop_reason = preview->stopReason();
+      if (preview->takeSnapshotRequest()) {
+        try {
+          saveSnapshot(frame, result);
+        } catch (const std::exception& error) {
+          std::cerr << "snapshot failed: " << error.what() << '\n';
+        }
+      }
     }
     report.add(read_ms, detect_ms, preview_ms);
     if (!stop_reason.empty()) break;
@@ -322,23 +363,32 @@ int main(int argc, char** argv) {
     if (options.threads > 0) cv::setNumThreads(options.threads);
     const road_finder::Config config = road_finder::loadConfig(options.config);
     road_finder::RoadDetector detector(config);
+    const bool use_serial = options.serial_enabled &&
+                            (camera_source || options.serial_device_explicit);
+    std::unique_ptr<road_finder::UartSender> serial;
+    if (use_serial) serial = std::make_unique<road_finder::UartSender>(options.serial_device);
     logGeometry(config, detector);
     {
       std::ostringstream runtime;
-      runtime << "runtime: threads " << cv::getNumThreads();
+      runtime << "runtime: segmentation " << config.segmentation_mode
+              << ", confirm " << config.classification_confirm_frames
+              << " frames, smooth " << config.geometry_smoothing_alpha
+              << ", threads " << cv::getNumThreads();
       if (options.display)
         runtime << ", preview " << cvRound(config.input_width * options.preview_scale) << 'x'
                 << cvRound(config.input_height * options.preview_scale);
       else
         runtime << ", preview off";
+      runtime << ", UART " << (serial ? options.serial_device : "off");
       if (options.preview_fps > 0.0) runtime << ", refresh " << options.preview_fps << " Hz";
       if (options.benchmark_frames > 0)
         runtime << ", benchmark " << options.benchmark_frames << " frames";
       std::cerr << runtime.str() << '\n';
     }
-    return camera_source ? runCamera(options, config, detector) : runImage(options, detector);
+    return camera_source ? runCamera(options, config, detector, serial.get())
+                         : runImage(options, detector, serial.get());
   } catch (const std::exception& error) {
-    std::cerr << "road_finder: " << error.what() << '\n';
+    std::cerr << "road_fucker: " << error.what() << '\n';
     return 1;
   }
 }

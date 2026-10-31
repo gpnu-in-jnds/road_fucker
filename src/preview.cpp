@@ -11,10 +11,10 @@
 namespace road_finder {
 namespace {
 
-constexpr const char* kPreviewWindow = "road_finder preview";
+constexpr const char* kPreviewWindow = "road_fucker preview";
 
 const char* roadCondition(const RoadResult& result) {
-  if (!result.valid) return "LOST";
+  if (!result.valid && result.type == RoadType::UNKNOWN) return "LOST";
   switch (result.type) {
     case RoadType::STRAIGHT: return "STRAIGHT";
     case RoadType::LEFT_TURN: return "LEFT TURN";
@@ -46,7 +46,8 @@ void drawInto(const cv::Mat& frame, const RoadResult& result, bool show_fps, dou
   const int text_thickness = std::max(1, cvRound(2 * s));
   const int line_thickness = std::max(1, cvRound(3 * s));
 
-  const int panel_height = show_fps ? 120 : 88;
+  const bool classification_only = !result.valid && result.type != RoadType::UNKNOWN;
+  const int panel_height = (show_fps ? 120 : 88) + (classification_only ? 32 : 0);
   const cv::Rect panel(cvRound(12 * s), cvRound(12 * s), cvRound(440 * s),
                        cvRound(panel_height * s));
   cv::Mat panel_pixels = canvas(panel);
@@ -55,7 +56,10 @@ void drawInto(const cv::Mat& frame, const RoadResult& result, bool show_fps, dou
   const cv::Scalar white(255, 255, 255);
   cv::putText(canvas, std::string("ROAD: ") + roadCondition(result), at(24, 43),
               cv::FONT_HERSHEY_SIMPLEX, font, white, text_thickness, cv::LINE_AA);
-  const std::string confidence = result.valid ? cv::format("%.2f", result.confidence) : "--";
+  const float displayed_confidence = result.type != RoadType::UNKNOWN
+      ? result.classification_confidence : result.confidence;
+  const std::string confidence = result.valid || classification_only
+      ? cv::format("%.2f", displayed_confidence) : "--";
   cv::putText(canvas, "CONFIDENCE: " + confidence, at(24, 76), cv::FONT_HERSHEY_SIMPLEX, font,
               white, text_thickness, cv::LINE_AA);
   if (show_fps) {
@@ -63,6 +67,9 @@ void drawInto(const cv::Mat& frame, const RoadResult& result, bool show_fps, dou
     cv::putText(canvas, "FPS: " + label, at(24, 109), cv::FONT_HERSHEY_SIMPLEX, font, white,
                 text_thickness, cv::LINE_AA);
   }
+  if (classification_only)
+    cv::putText(canvas, "GEOMETRY: UNAVAILABLE", at(24, show_fps ? 141 : 108),
+                cv::FONT_HERSHEY_SIMPLEX, font * 0.8, white, text_thickness, cv::LINE_AA);
   // Detection window actually used for this frame, in input-image pixels.
   if (result.roi_polygon.size() == 4) {
     std::vector<cv::Point> window;
@@ -134,6 +141,7 @@ bool Preview::show(const cv::Mat& frame, const RoadResult& result, int wait_ms) 
     drawn_once_ = true;
   }
   const int key = cv::waitKey(wait_ms);
+  if (key == 's' || key == 'S') snapshot_requested_ = true;
   frameCompleted();
   if (key == 27 || key == 'q' || key == 'Q') {
     stop_reason_ = "preview stopped by key";

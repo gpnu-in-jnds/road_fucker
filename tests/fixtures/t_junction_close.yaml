@@ -1,0 +1,8 @@
+%YAML:1.0
+---
+# Original captured frame, without stretching its 640x480 aspect ratio.
+input_width: 640
+input_height: 480
+process_width: 640
+roi: [0, 240, 640, 240]
+segmentation_mode: adaptive_dark
