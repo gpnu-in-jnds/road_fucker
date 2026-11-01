@@ -31,7 +31,10 @@ if(BUILD_TESTING)
   target_link_libraries(road_fucker_tests PRIVATE road_fucker_lib)
   target_compile_definitions(road_fucker_tests PRIVATE
     ROAD_FUCKER_SAMPLE_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/frame_784.png"
-    ROAD_FUCKER_CLOSE_T_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/t_junction_close.png")
+    ROAD_FUCKER_CLOSE_T_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/t_junction_close.png"
+    ROAD_FUCKER_NEAR_T_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/t_junction_near_raw.png"
+    ROAD_FUCKER_APPROACH_T_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/t_junction_approach_raw.png"
+    ROAD_FUCKER_LIVE_T_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/t_junction_live_720p.png")
   add_test(NAME road_fucker_tests COMMAND road_fucker_tests)
 
   add_executable(road_fucker_preview_tests tests/preview_window_test.cpp)
@@ -51,6 +54,8 @@ if(BUILD_TESTING)
 
   add_executable(road_fucker_uart_tests tests/uart_packet_test.cpp)
   target_link_libraries(road_fucker_uart_tests PRIVATE road_fucker_lib)
+  target_compile_definitions(road_fucker_uart_tests PRIVATE
+    ROAD_FUCKER_NEAR_T_IMAGE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/t_junction_near_raw.png")
   target_compile_options(road_fucker_uart_tests PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME road_fucker_uart_tests COMMAND road_fucker_uart_tests)
 endif()

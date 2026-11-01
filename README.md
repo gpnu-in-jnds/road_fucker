@@ -25,7 +25,19 @@ ctest --test-dir build --output-on-failure
 ./build/road_fucker --source tests/fixtures/t_junction_close.png --config tests/fixtures/t_junction_close.yaml --no-display --no-serial --json
 ```
 
-检测回归同时覆盖这张图的镜像、320/640 处理宽度、单侧出口、反光路面和较暗地面。
+另一张横梁占满画面、入口只在底部两角可见的原始帧为
+`tests/fixtures/t_junction_near_raw.png`（2026-11-01 10:01:49，640×480），
+使用同一配置也应输出 `T_JUNCTION`，而不是 `LOST`。此时循迹几何可能不可用，
+`valid: false` 不等于路口分类失败；已识别的左转、右转、T 字路口在无中线时仍发送
+对应类型的 7 字节串口包，偏移和角度填 0。
+另一张2026-11-01 11:11:28的接近路口原图保存在`tests/fixtures/t_junction_approach_raw.png`。
+该图单帧可识别T，但旧视频配置的3帧确认会使前两帧仍显示STRAIGHT，且中线不可用时发送UNKNOWN。
+默认视频确认改为1帧，首次测得T就回传，与STM32的单包转向预备锁定一致；可通过配置恢复多帧确认。
+检测回归覆盖三张原图及镜像、320/640处理宽度、720p缩放、直线后首帧T立即发布、单侧出口、反光路面和较暗地面。
+
+实机1280×720样图`tests/fixtures/t_junction_live_720p.png`覆盖远端边界倾斜并贴近画面上沿的情况。
+其两角残留的窄道路区域不能作为有效前向出口：T判定排除左右各5%的窄边缘后检查前向道路宽度，
+仍须有连续的双侧出口及前方封闭证据。单侧转弯继续要求全宽封闭；内侧仍有可测宽度的前向支路不判T。
 
 源码按职责分为：`src/main.cpp`（参数解析与主循环）、`src/camera.cpp`（摄像头采集）、
 `src/preview.cpp`（预览与叠加绘制）、`src/road_detector.cpp`（检测算法）和
@@ -34,7 +46,7 @@ ctest --test-dir build --output-on-failure
 ## 运行
 
 ```sh
-./build/road_fucker                    # 默认 /dev/video0，打开预览窗口，不输出 JSON
+./build/road_fucker                    # 默认 /dev/video0 + /dev/ttyS1，打开预览窗口
 ./build/road_fucker --source /dev/video2
 ./build/road_fucker --source 0 --camera-fourcc MJPG --camera-fps 30
 ./build/road_fucker --json             # 需要时逐帧输出 JSON
@@ -85,7 +97,7 @@ FPS 统计完整的读取、处理、输出与显示循环，
 中线几何是否可用：可能出现 `valid: false, type: "T_JUNCTION"`，此时边线和中线数组为空，
 偏移与角度不可用于循迹。停止区识别默认关闭；启用后命中停止颜色会立即清除已确认类型。
 
-实时摄像头默认向 `/dev/ttyS0` 发送 115200、8N1 的道路帧。可用 `--serial-device`
+实时摄像头默认使用 `/dev/video0`，向 `/dev/ttyS1` 发送 115200、8N1 的道路帧。可用 `--serial-device`
 覆盖设备路径，或用 `--no-serial` 关闭串口。图片源默认不发送，显式指定
 `--serial-device` 后才发送一次。串口发送失败会报错退出；UART 二进制数据不会写入
 stdout，`--json` 输出仍保持为逐帧 JSON。
@@ -94,8 +106,11 @@ stdout，`--json` 输出仍保持为逐帧 JSON。
 `FF 7A type offset_x_le16 angle_le16`（7 字节），UNKNOWN 为 `FF 7A 04`（3 字节）。
 类型值 0/1/2/3 依次表示直行/左转/右转/T 字路口。偏移使用 128 像素参考坐标，中心为 64、
 右偏为正；角度以度为单位，竖直为 0、左偏为负、右偏为正。协议不支持的分支类型按
-UNKNOWN 发送。仅识别到路口而没有有效中线几何时，串口也发送 UNKNOWN，
-因为现有协议的已知类型包要求同时提供偏移与角度；独立路口分类可从 JSON 获取。
+UNKNOWN 发送。已识别的左转、右转、T 字路口独立于中线有效性发送：没有有效中线时，
+保留类型 1/2/3，偏移和角度均填 0，例如 T 字路口为 `FF 7A 03 00 00 00 00`。
+这时 JSON 仍为 `valid: false`，预览仍标记 `GEOMETRY: UNAVAILABLE`；0 字段是协议
+占位值，不代表测得居中。中线有效时继续发送实测偏移和角度。直行仍要求有效中线，
+否则按 UNKNOWN 发送；停止区命中或分类为 UNKNOWN 时仍发送 `FF 7A 04`。
 
 ## 性能与帧率
 
@@ -191,8 +206,8 @@ G_MESSAGES_DEBUG=all ./build/road_fucker --no-display 2>&1 | tee /tmp/road_finde
   没有两侧边界的整幅色块仍为 UNKNOWN，也不会凭少量入口行生成中线。
   双侧出口证据充分时，极细的连通色噪不算有效前向道路；此容错只用于 T 字口，
   单侧转弯仍要求完整封闭，以保留斜直道和渐宽直道的防误判约束。
-- `classification_confirm_frames` / `classification_hold_frames`：视频默认连续 `3` 帧确认新类型，
-  最多保持 `2` 帧不一致或丢失的分类，避免单帧噪声闪烁；图片模式不做多帧确认。
+- `classification_confirm_frames` / `classification_hold_frames`：视频默认 `1` 帧发布新类型，
+  丢失时最多保持旧分类 `2` 帧；不保留失效中线。需要多帧消抖时可提高前者；图片模式不做多帧确认。
 - `geometry_smoothing_alpha`：视频边线、中线、偏移与角度的平滑系数，默认 `0.35`，`1` 为不平滑。
   只平滑连续可测的几何，丢失时不复用旧中线；流中断超过 500 ms 或时间倒退会清除状态。
 - `road_lab`：仅 `lab` 模式使用，格式为 OpenCV 8 位 LAB 的

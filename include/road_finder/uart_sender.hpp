@@ -16,6 +16,8 @@ struct RoadPacket {
 
 // Encodes the fixed STM32 XDK42 contract. input_width is used to convert the
 // fitted source-image center to the sample's 128-pixel reference coordinates.
+// Known left/right/T junctions without geometry keep their type and use zero
+// offset/angle. Straight still requires geometry; UNKNOWN remains three bytes.
 RoadPacket encodeRoadPacket(const RoadResult& result, int input_width);
 
 class UartSender {

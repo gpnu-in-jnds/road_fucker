@@ -20,9 +20,8 @@ constexpr double kReferenceWidth = 128.0;
 constexpr double kRadiansToDegrees = 180.0 / CV_PI;
 
 std::uint8_t wireType(const RoadResult& result) {
-  if (!result.valid) return 0x04;
   switch (result.type) {
-    case RoadType::STRAIGHT: return 0x00;
+    case RoadType::STRAIGHT: return result.valid ? 0x00 : 0x04;
     case RoadType::LEFT_TURN: return 0x01;
     case RoadType::RIGHT_TURN: return 0x02;
     case RoadType::T_JUNCTION: return 0x03;
@@ -61,6 +60,12 @@ RoadPacket encodeRoadPacket(const RoadResult& result, int input_width) {
     return packet;
   }
 
+  packet.size = packet.bytes.size();
+  // Junction topology remains useful when a close crossbar hides the stem.
+  // The fixed seven-byte contract has no geometry-valid flag: use zero
+  // placeholders and never reuse measurements from an invalid result.
+  if (!result.valid) return packet;
+
   if (result.centerline.empty())
     throw std::invalid_argument("valid road result has no centerline for UART offset");
   const auto bottom = std::max_element(
@@ -71,7 +76,6 @@ RoadPacket encodeRoadPacket(const RoadResult& result, int input_width) {
   const auto angle = boundedInt16(std::lround(result.heading_error_rad * kRadiansToDegrees));
   appendInt16(packet.bytes, 3, offset);
   appendInt16(packet.bytes, 5, angle);
-  packet.size = packet.bytes.size();
   return packet;
 }
 

@@ -16,9 +16,9 @@ road_contrast_min: 18
 min_road_width_fraction: 0.06
 max_road_width_fraction: 0.85
 
-# Video only: confirm a type change over three frames, bridge at most two noisy
-# observations, and smooth consecutive measured geometry. No stale steering.
-classification_confirm_frames: 3
+# Video only: publish a new measured type immediately, matching STM32's
+# single-report corner latch. Geometry smoothing and dropout hold are separate.
+classification_confirm_frames: 1
 classification_hold_frames: 2
 geometry_smoothing_alpha: 0.35
 

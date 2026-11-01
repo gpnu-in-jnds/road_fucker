@@ -408,6 +408,36 @@ void expectAsymmetricCloseJunctions() {
   }
 }
 
+void expectClippedFarEdgeAtTJunction() {
+  auto config = testConfig();
+  config.segmentation_mode = "adaptive_dark";
+  for (int width : {320, 640}) {
+    config.process_width = width;
+    road_finder::RoadDetector detector(config);
+    const int height = config.processHeight();
+    cv::Mat t = wideJunction(30, 245, 80);
+    // A tilted far edge can leave road in both outer corners while a broad
+    // floor cap blocks the center. These strips are too narrow to be a lane.
+    cv::rectangle(t, {0, 0}, {20, 30}, cv::Scalar(255), cv::FILLED);
+    cv::rectangle(t, {619, 0}, {639, 30}, cv::Scalar(255), cv::FILLED);
+    cv::Mat scaled;
+    cv::resize(t, scaled, cv::Size(width, height), 0, 0, cv::INTER_NEAREST);
+    require(detector.processMask(scaled, 100).type == road_finder::RoadType::T_JUNCTION,
+            "thin outer-corner road remnants must not erase a closed T far edge");
+
+    for (bool mirror : {false, true}) {
+      cv::Mat open = wideJunction(100, 245, 80);
+      // An actual forward exit at the image edge retains measurable width
+      // inside the edge margin, even when its outer boundary is clipped.
+      cv::rectangle(open, {580, 0}, {639, 100}, cv::Scalar(255), cv::FILLED);
+      if (mirror) cv::flip(open, open, 1);
+      cv::resize(open, scaled, cv::Size(width, height), 0, 0, cv::INTER_NEAREST);
+      require(detector.processMask(scaled, 101).type != road_finder::RoadType::T_JUNCTION,
+              "a measurable off-axis forward exit must keep the T far edge open");
+    }
+  }
+}
+
 void expectJunctionColorUnderUnevenLight() {
   auto config = testConfig();
   config.segmentation_mode = "adaptive_dark";
@@ -441,9 +471,9 @@ void expectJunctionColorUnderUnevenLight() {
   }
 }
 
-void expectCapturedCloseTJunction() {
-  const cv::Mat captured = cv::imread(ROAD_FUCKER_CLOSE_T_IMAGE, cv::IMREAD_COLOR);
-  require(!captured.empty(), "captured close T image is missing");
+void expectCapturedCloseTJunction(const char* path) {
+  const cv::Mat captured = cv::imread(path, cv::IMREAD_COLOR);
+  require(!captured.empty(), std::string("captured close T image is missing: ") + path);
   cv::Mat mirrored, resized;
   cv::flip(captured, mirrored, 1);
   cv::resize(captured, resized, cv::Size(1280, 720));
@@ -461,6 +491,21 @@ void expectCapturedCloseTJunction() {
       require(result.type == road_finder::RoadType::T_JUNCTION &&
                   result.available_directions == (road_finder::LEFT | road_finder::RIGHT),
               "captured T must retain both exits across mirroring and processing sizes");
+
+      // The supplied video preset publishes on the first measured T frame.
+      // A previously accepted straight must not mask that junction label.
+      config.classification_confirm_frames = 1;
+      config.classification_hold_frames = 2;
+      road_finder::RoadDetector video(config);
+      cv::Mat incoming = cv::Mat::zeros(config.processHeight(), process_width, CV_8UC1);
+      cv::rectangle(incoming, {process_width * 2 / 5, 0},
+                    {process_width * 3 / 5, incoming.rows - 1}, cv::Scalar(255), cv::FILLED);
+      require(video.processMask(incoming, 1000, true).type == road_finder::RoadType::STRAIGHT,
+              "video fixture must first accept the incoming straight");
+      const auto first_t = video.process(image, 1067, true);
+      require(first_t.raw_type == road_finder::RoadType::T_JUNCTION &&
+                  first_t.type == road_finder::RoadType::T_JUNCTION,
+              "single-frame preset must publish the first captured T after straight");
     }
   }
 }
@@ -571,8 +616,12 @@ int main() {
     expectForwardContinuationNotTurn();
     expectVeryCloseTJunctionEvidence();
     expectAsymmetricCloseJunctions();
+    expectClippedFarEdgeAtTJunction();
     expectJunctionColorUnderUnevenLight();
-    expectCapturedCloseTJunction();
+    expectCapturedCloseTJunction(ROAD_FUCKER_CLOSE_T_IMAGE);
+    expectCapturedCloseTJunction(ROAD_FUCKER_NEAR_T_IMAGE);
+    expectCapturedCloseTJunction(ROAD_FUCKER_APPROACH_T_IMAGE);
+    expectCapturedCloseTJunction(ROAD_FUCKER_LIVE_T_IMAGE);
     expectTemporalStability();
     expectStopDuringJunctionDropout();
     std::cout << "road detector tests passed\n";

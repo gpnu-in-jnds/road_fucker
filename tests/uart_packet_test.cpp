@@ -1,5 +1,7 @@
 #include "road_finder/uart_sender.hpp"
 
+#include <opencv2/imgcodecs.hpp>
+
 #include <initializer_list>
 #include <iostream>
 #include <stdexcept>
@@ -65,15 +67,58 @@ int main() {
     t.valid = false;
     t.centerline.clear();
     expectPacket(road_finder::encodeRoadPacket(t, 1280),
-                 {0xFF, 0x7A, 0x04}, "recognized junction without measured steering geometry");
+                 {0xFF, 0x7A, 0x03, 0x00, 0x00, 0x00, 0x00},
+                 "recognized T without measured steering geometry");
+
+    for (const auto type : {road_finder::RoadType::LEFT_TURN,
+                            road_finder::RoadType::RIGHT_TURN,
+                            road_finder::RoadType::T_JUNCTION}) {
+      t.type = type;
+      // Invalid geometry must ignore even leftover nonzero measurements.
+      t.centerline = {{740.0f, 600.0f}};
+      t.heading_error_rad = -0.5f;
+      const auto wire_type = static_cast<std::uint8_t>(
+          type == road_finder::RoadType::LEFT_TURN ? 1 :
+          (type == road_finder::RoadType::RIGHT_TURN ? 2 : 3));
+      expectPacket(road_finder::encodeRoadPacket(t, 1280),
+                   {0xFF, 0x7A, wire_type, 0x00, 0x00, 0x00, 0x00},
+                   "junction type survives unavailable geometry with zero fields");
+    }
+    t.type = road_finder::RoadType::STRAIGHT;
+    expectPacket(road_finder::encodeRoadPacket(t, 1280),
+                 {0xFF, 0x7A, 0x04}, "straight still requires measured geometry");
+
+    const cv::Mat captured = cv::imread(ROAD_FUCKER_NEAR_T_IMAGE, cv::IMREAD_COLOR);
+    require(!captured.empty(), "captured near T image is missing");
+    for (int process_width : {320, 640}) {
+      road_finder::Config config;
+      config.input_width = captured.cols;
+      config.input_height = captured.rows;
+      config.process_width = process_width;
+      config.roi = {0, captured.rows / 2, captured.cols, captured.rows - captured.rows / 2};
+      config.segmentation_mode = "adaptive_dark";
+      road_finder::RoadDetector detector(config);
+      const auto result = detector.process(captured, 100);
+      require(result.type == road_finder::RoadType::T_JUNCTION && !result.valid &&
+                  result.centerline.empty(), "captured T must reproduce missing geometry");
+      expectPacket(road_finder::encodeRoadPacket(result, captured.cols),
+                   {0xFF, 0x7A, 0x03, 0x00, 0x00, 0x00, 0x00},
+                   "captured T must reach STM32 as type 03");
+    }
 
     road_finder::RoadResult unknown;
     expectPacket(road_finder::encodeRoadPacket(unknown, 1280),
                  {0xFF, 0x7A, 0x04}, "unknown");
-    unknown.valid = true;
-    unknown.type = road_finder::RoadType::RIGHT_BRANCH;
-    expectPacket(road_finder::encodeRoadPacket(unknown, 1280),
-                 {0xFF, 0x7A, 0x04}, "unsupported branch type");
+    for (bool valid : {false, true}) {
+      unknown.valid = valid;
+      for (const auto type : {road_finder::RoadType::UNKNOWN,
+                              road_finder::RoadType::LEFT_BRANCH,
+                              road_finder::RoadType::RIGHT_BRANCH}) {
+        unknown.type = type;
+        expectPacket(road_finder::encodeRoadPacket(unknown, 1280),
+                     {0xFF, 0x7A, 0x04}, "unknown and unsupported types");
+      }
+    }
 
     bool threw = false;
     try {

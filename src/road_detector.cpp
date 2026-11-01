@@ -383,7 +383,11 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
   struct Span { int left = 0; int right = -1; int width() const { return right - left + 1; } };
   std::vector<Span> profile(mask.rows);
   std::vector<bool> connected_rows(mask.rows, false);
-  std::vector<int> connected_widths(mask.rows, 0);
+  std::vector<int> forward_widths(mask.rows, 0);
+  // At the far image border a tilted crossbar can leave thin road remnants
+  // in the outer corners. For T-only closure, measure forward road inside a
+  // narrow inset; a real exit retaining measurable interior width stays open.
+  const int forward_inset = std::max(1, cvRound(roi.width * 0.05));
   const int center = cvRound(centroids.at<double>(best, 0));
   for (int y = 0; y < mask.rows; ++y) {
     const int* row = labels.ptr<int>(y);
@@ -394,7 +398,9 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
       const int left = x;
       while (x < roi.x + roi.width && row[x] == best) ++x;
       connected_rows[y] = true;
-      connected_widths[y] = std::max(connected_widths[y], x - left);
+      const int forward_left = std::max(left, roi.x + forward_inset);
+      const int forward_right = std::min(x, roi.x + roi.width - forward_inset);
+      forward_widths[y] = std::max(forward_widths[y], forward_right - forward_left);
       const int distance = center < left ? left - center : std::max(0, center - x + 1);
       if (distance < nearest) {
         nearest = distance;
@@ -466,10 +472,10 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
     // A slanted or flared forward lane may still continue elsewhere in the
     // same connected component, all the way to the top of the image.
     closed_rows = connected_rows[y] ? 0 : closed_rows + 1;
-    // A very thin connected streak is not a measurable forward road. This
-    // relaxed closure is T-only: a one-sided turn still needs complete
-    // closure so a tapering/slanted forward lane cannot become LEFT/RIGHT.
-    t_closed_rows = connected_widths[y] < minimum_forward_width ? t_closed_rows + 1 : 0;
+    // Thin outer-corner remnants and very thin connected streaks cannot
+    // supply a measurable forward road. This relaxation is T-only: a
+    // one-sided turn still needs complete closure over the full image width.
+    t_closed_rows = forward_widths[y] < minimum_forward_width ? t_closed_rows + 1 : 0;
     narrow_forward_rows = forward && !left && !right ? narrow_forward_rows + 1 : 0;
     if (narrow_forward_rows >= probe) max_left = max_right = max_both = 0;
     if (closed_rows >= probe || t_closed_rows >= probe) {

@@ -23,7 +23,7 @@ namespace {
 
 constexpr const char* kDefaultSource = "/dev/video0";
 constexpr const char* kDefaultConfig = "config/road_finder.yaml";
-constexpr const char* kDefaultSerialDevice = "/dev/ttyS0";
+constexpr const char* kDefaultSerialDevice = "/dev/ttyS1";
 constexpr double kDefaultCameraFps = 30.0;
 
 struct Options {
@@ -48,7 +48,7 @@ void usage() {
   std::cout << "road_fucker [--source /dev/video0|0|frame.png] [--config file] [--no-display] "
                "[--json] [--camera-fourcc MJPG] [--camera-fps 30] [--preview-scale 1.0] "
                "[--preview-fps 0] [--threads N] [--benchmark frames] [--overlay file] "
-               "[--mask file] [--serial-device /dev/ttyS0|--no-serial]\n"
+               "[--mask file] [--serial-device /dev/ttyS1|--no-serial]\n"
                "Defaults: --source "
             << kDefaultSource << ", --config " << kDefaultConfig
             << ", preview window open at full size, no JSON output, UART "
