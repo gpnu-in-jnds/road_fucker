@@ -1,10 +1,9 @@
 # road_fucker
 
 面向地瓜派 RDK X5 的 C++17 / OpenCV 4 道路识别程序。相机固定朝前下方拍摄，输入为
-1280×720 BGR 图像，默认缩放至 640×360 处理。默认配置面向“深色道路、浅色地面”，
-优先估计当前帧道路与地面的色差，色差不足时使用逐行与整帧亮度分割；
-从底部选择连续道路区域，也支持标定后的 LAB 颜色阈值。
-六个横向区域用于拟合道路方向，路口根据入口、横向出口和前方封闭区域分类。
+1280×720 BGR 图像，默认缩放至 640×360 处理。默认使用中央与两侧分区 HSV 阈值过滤道路颜色，
+也可选择 `adaptive_dark` 自适应色差与亮度分割。主 ROI 沿纵向均分为 `--threads × 6` 个横向条带，
+默认 1 线程、6 块；候选提取与左右各三个路口框并行计算，再按固定顺序筛选、拟合道路方向。
 路况分类与中线几何独立：能识别 T 字路口但无法测量中线时，不生成虚假的偏移。
 
 ## 构建
@@ -12,11 +11,20 @@
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure
 ```
 
 需要 OpenCV 4 的 `core`、`imgproc`、`videoio`、`highgui`、`imgcodecs` 模块，
-无需 contrib。开发机也可使用 OpenCV 5 构建。无显示器时加 `--no-display`。
+无需 contrib。开发机也可使用 OpenCV 5 构建。默认不创建显示窗口。
+
+测试默认不构建，必须通过 CMake 开关显式启用；样图需要先取得 Git LFS 实际内容：
+
+```sh
+cmake -S . -B build/tests -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build/tests -j
+ctest --test-dir build/tests --output-on-failure
+```
+
+已有构建目录保留 CMake 缓存值，需要关闭测试时使用 `-DBUILD_TESTING=OFF`。
 
 近景 T 字路口回归样图为 `tests/fixtures/t_junction_close.png`（640×480）。
 下列配置保留原图比例，可重现分类结果：
@@ -46,20 +54,20 @@ ctest --test-dir build --output-on-failure
 ## 运行
 
 ```sh
-./build/road_fucker                    # 默认 /dev/video0 + /dev/ttyS1，打开预览窗口
+./build/road_fucker                    # 默认 /dev/video0 + /dev/ttyS1，无显示窗口
 ./build/road_fucker --source /dev/video2
 ./build/road_fucker --source 0 --camera-fourcc MJPG --camera-fps 30
 ./build/road_fucker --json             # 需要时逐帧输出 JSON
-./build/road_fucker --no-display --json
+./build/road_fucker --display --threads 4 # 开启预览，24 个 ROI 分块
 ./build/road_fucker --serial-device /dev/ttyS1
 ./build/road_fucker --no-serial        # 关闭默认串口输出
 ./build/road_fucker --source frame.png --overlay /tmp/overlay.png --mask /tmp/mask.png
 ```
 
 不带任何参数时，程序打开 `/dev/video0`（V4L2、MJPG、配置中的 1280×720 与 30 FPS），
-逐帧检测并弹出预览窗口。`--source` 只接受摄像头序号（`0`）、`/dev/videoN` 路径或图片
+逐帧检测，显式传入 `--display` 才弹出预览窗口。`--source` 只接受摄像头序号（`0`）、`/dev/videoN` 路径或图片
 （`.png/.jpg/.jpeg/.bmp/.webp`）；视频文件与 GStreamer 管道不再支持，会直接报错。
-`--display`、`--no-json` 仍作为兼容别名被接受（分别等价于默认行为）。
+`--no-display`、`--no-json` 仍作为兼容参数被接受，分别关闭窗口和 JSON 输出。
 
 两种摄像头来源都会请求配置中的 1280×720 和默认的 30 FPS。`/dev/videoN` 默认先选择 MJPG，
 以支持常见 UVC 摄像头的 720p/30 FPS 模式；可用 `--camera-fourcc`、`--camera-fps` 覆盖。
@@ -73,6 +81,24 @@ ctest --test-dir build --output-on-failure
 
 `--overlay`、`--mask` 只用于单张图片。视频预览逐帧显示最终拟合的左边线
 （青色）、右边线（橙色）和中线（绿色），以及当前路况、置信度和实际显示帧率。
+每个有效分块的实测中点为实心紫色点，中线拟合点为黄色圆圈；几何整体无效时仍显示已测到的中点。
+左右路口框编号为 `L1–L3`、`R1–R3`，当前框命中为绿色，未命中为红色。框状态取当前帧证据，
+不沿用历史分类；每侧至少两个框命中才有效，状态面板显示左右命中数与 `VALID/INVALID`。
+T 字口必须双侧均有效，单侧转弯必须该侧有效且有对应拓扑证据。票数不足时不发布路口，
+历史分类保持也不能绕过当前帧票数；T 只通过一侧时不会直接改判成单侧转弯。
+
+`--full-process` 选择四格过程拼图：原图、颜色掩码（处理/透视坐标）、分块与实测中点、
+最终拟合及六个路口框。它通过 `--display` 开窗，也可在无界面图片模式下通过 `--overlay` 导出：
+
+```sh
+./build/road_fucker --display --full-process --threads 4
+./build/road_fucker --source tests/fixtures/t_junction_live_720p.png --no-serial --threads 4 --full-process --overlay build/process.png
+```
+
+拼图每格保持原图尺寸，窗口及导出图宽高各为原图的两倍，可用 `--preview-scale 0.5` 缩小窗口。
+掩码面板中中央道路为绿色，两侧道路为青色，白色候选为灰色，经道路几何支持的遮挡为紫色，
+辅助连接为橙色；分区竖线使用处理/透视坐标。白色候选不等于已经确认的减速带。
+`--mask` 始终导出处理分辨率的原始道路二值掩码，不包含辅助连接。过程模式下按 S 还会额外保存 `_process.png`。
 预览窗口按 1280×720 画面尺寸打开，并保持原始宽高比；仍可手动调整窗口大小。
 画面上的黄色细框是当前生效的检测窗口，含义与调法见[配置与现场标定](#配置与现场标定)。
 路况标签包括 `STRAIGHT`、`LEFT TURN`、`RIGHT TURN`、`T JUNCTION`、
@@ -83,13 +109,14 @@ FPS 统计完整的读取、处理、输出与显示循环，
 摄像头预览中按 **S**，在 `build/captures/` 保存同一帧的 `<时间戳>_raw.png`（原始画面）、
 `_mask.png`（分割掩码）、`_overlay.png`（叠加图）；拍屏带有摩尔纹，诊断时优先使用这些文件。
 按 Esc 或 Q、关闭窗口时结束预览，并在 stderr 打印实际停止原因。
-`--no-display` 关闭预览窗口，供无显示器的场合使用，与 `--json` 组合即可无界面运行。
+默认无界面运行；`--no-display` 也可显式关闭预览。
 在 GTK 后端的 OpenCV（RDK X5、Ubuntu 自带 OpenCV 4）上，highgui 没有实现用于检测
 关窗的 `WND_PROP_VISIBLE` 属性，点窗口关闭按钮后 OpenCV 会重新创建预览窗口；
 请用 Esc、Q 或 Ctrl+C 结束预览，程序会在若干帧后提示一次该限制。
 
 加 `--json` 时，每帧在 stdout 输出一行 JSON；处理耗时和错误始终写入 stderr。字段包含
 `timestamp_ms`、`valid`、`type`、`raw_type`、`classification_confidence`、`directions`、`confidence`、
+`left_junction_hits`、`right_junction_hits`、`occlusion_detected`、
 `lateral_error`、`heading_error_rad`、`left_boundary`、`right_boundary`、
 `centerline`。边线和中线坐标均基于原始 720p 图像。横向偏差按半幅道路宽度归一化，
 目标中线在车体右侧时为正；方向偏差向右为正。`confidence` 表示道路几何结果的可信度；
@@ -124,8 +151,8 @@ fps 5.2 | read 12.1 ms | detect 41.3 ms | preview 122.5 ms | frames 26
 `imshow` + `waitKey`。`--benchmark <frames>` 跑固定帧数后打印各阶段均值并退出，便于前后对比：
 
 ```sh
-./build/road_fucker --benchmark 300 --no-display   # 只测检测吞吐（也可以配图片源）
-./build/road_fucker --benchmark 300                # 含预览，两行相减就是显示开销
+./build/road_fucker --benchmark 300                # 只测检测吞吐（也可以配图片源）
+./build/road_fucker --benchmark 300 --display      # 含预览
 ```
 
 按结果对症下药：
@@ -142,8 +169,14 @@ fps 5.2 | read 12.1 ms | detect 41.3 ms | preview 122.5 ms | frames 26
   全帧 BGR→RGB 转换，窗口小于画面时还要再做一次 `INTER_AREA` 缩放，最后用 cairo 软件绘制，
   所以显示开销基本与像素数成正比；RDK X5 上建议 `0.5`（像素数降到 1/4）。
 - `--preview-fps <Hz>`：限制预览重绘频率，检测与 JSON 输出不受影响（按键、关窗检测仍每帧处理）。
-- `--threads <N>`：设置 OpenCV 线程数；默认使用 OpenCV 的线程配置。
+- `--threads <N>`：检测工作线程数，默认 `1`；主 ROI 分块数严格为 `6×N`，例如 `4` 对应 `24` 块。
+  分块数量超过处理后 ROI 高度时报错。持久线程池复用工作线程，OpenCV 内部使用单线程，
+  避免嵌套并行；提高 N 同时提高采样密度，结果与耗时可能变化，不能假定线程越多越快。
 - `--benchmark <frames>`：跑固定帧数后打印统计并退出，方便在目标机上量化每次调整。
+
+开发环境 OpenCV 5、720p 实机路口图片、无显示、重复 300 帧的初步检测均值：
+1 线程 / 6 块约 3.3 ms，2 线程 / 12 块约 2.6 ms，4 线程 / 24 块约 2.4 ms。
+这些是开发机数据；线程数也改变分块密度，RDK X5 上的实际吞吐需要单独实测。
 
 ## 故障排查
 
@@ -186,13 +219,14 @@ G_MESSAGES_DEBUG=all ./build/road_fucker --no-display 2>&1 | tee /tmp/road_finde
   `perspective_src/perspective_dst` 使用同一坐标系；对着画面量出道路的大致范围直接填即可。
   窗口必须延伸到画面高度的 80% 以下。路口形态在相同横向范围内搜索整帧高度，
   可识别循迹窗口上方的横道；黄色框仍只表示循迹窗口。
-- `segmentation_mode`：随附配置使用 `adaptive_dark`。从底部中央估计道路颜色，
+- `segmentation_mode`：默认及随附配置均为 `hsv`，使用固定 HSV 颜色阈值。
+  可选 `adaptive_dark` 从底部中央估计道路颜色，
   从较亮的顶部边缘和下方外侧区域估计地面颜色；色差足够时用 B−G、R−G 色差分割，
   避免反光路面变亮或阴影地面变暗造成单侧出口丢失，不固定道路颜色。
   色差不足时比较逐行与整帧灰度分布；一行铺满道路时参考整帧亮度，保留 T 字横道。
   适合深色道路、浅色地面；
   画面仍需保留可区分的道路和地面，完全单色的画面不能提供可靠路口证据。
-  设置为 `lab` 可恢复固定颜色阈值；旧配置未填写此键时也使用 `lab`。
+  `lab` 模式已移除，需重新标定为 HSV。
 - `road_contrast_min`：自适应模式的最小灰度差，默认 `18`（0–255），
   也用于筛选比入口道路更亮的地面参考。缺少足够色差和亮度对比时不分割。
 - `min_road_width_fraction` / `max_road_width_fraction`：候选道路宽度占处理图宽度的范围，
@@ -207,13 +241,40 @@ G_MESSAGES_DEBUG=all ./build/road_fucker --no-display 2>&1 | tee /tmp/road_finde
   双侧出口证据充分时，极细的连通色噪不算有效前向道路；此容错只用于 T 字口，
   单侧转弯仍要求完整封闭，以保留斜直道和渐宽直道的防误判约束。
 - `classification_confirm_frames` / `classification_hold_frames`：视频默认 `1` 帧发布新类型，
-  丢失时最多保持旧分类 `2` 帧；不保留失效中线。需要多帧消抖时可提高前者；图片模式不做多帧确认。
+  丢失时最多保持旧分类 `2` 帧；路口当前票数不足时立即清除，遮挡导致分类不可用时也不保持。
+  不保留失效中线。需要多帧消抖时可提高前者；图片模式不做多帧确认。
 - `geometry_smoothing_alpha`：视频边线、中线、偏移与角度的平滑系数，默认 `0.35`，`1` 为不平滑。
   只平滑连续可测的几何，丢失时不复用旧中线；流中断超过 500 ms 或时间倒退会清除状态。
-- `road_lab`：仅 `lab` 模式使用，格式为 OpenCV 8 位 LAB 的
-  `[Lmin,Lmax,amin,amax,bmin,bmax]`，需要按相机原始帧标定。
-- `scan_bands` 与顶部、左右、停止区 ROI 使用样例的 128×90 坐标，程序按处理图宽高缩放。
-- blob 面积阈值使用 128×90 参考像素，程序按处理分辨率缩放。
+- `road_hsv`：格式为 `[Hmin,Hmax,Smin,Smax,Vmin,Vmax]`，H 为 `0–179`，S/V 为 `0–255`。
+  Hmin 大于 Hmax 时跨越零点，例如红色可写 `[170,10,...]`；S/V 必须上下限有序。
+  默认 `[80,135,10,150,40,230]` 针对实机偏蓝道路：720p 样图底部中央 H 中位数为 112、
+  S 为 63，浅色地面 H 约 35、S 约 17；其余路口原图道路 H 中位数为 110–116。
+  旧 `frame_784.png` 道路接近无彩色、与实机色调不同，此默认范围不适用，可使用
+  `adaptive_dark` 或单独标定；固定范围需要按实际相机与光照复核。
+- `side_road_hsv`：左右暗侧共用一套 HSV 范围；省略时动态继承 `road_hsv`。
+  中央与两侧先分别过滤，再合成道路掩码，侧框不会预先经过中央阈值。
+  随附侧区范围与中央相同，仅作为未标定初值；现场需分别采样中央道路、两侧道路及背景，
+  调整 H/S/V，尤其检查暗侧的 S/V 分布。`adaptive_dark` 模式不使用这两套固定颜色阈值。
+- `side_left_end_reference` / `side_right_begin_reference`：处理/透视视图中的左右分区边界，
+  使用 128 像素参考宽度，默认 `36` / `92`；三段覆盖整个图像，满足 `0 < 左 < 右 < 128`。
+- `left_marker_rois` / `right_marker_rois`：每侧三个 `[x,y,width,height]`，使用 128×90 参考坐标。
+  默认上移成镜像三角形，顺序为外侧中间、内侧上方、内侧下方：
+  左侧 `[10,38,10,10]`、`[24,28,10,10]`、`[24,48,10,10]`；
+  右侧 `[108,38,10,10]`、`[94,28,10,10]`、`[94,48,10,10]`。
+- `marker_min_coverage`：单框覆盖率阈值，默认 `0.35`；与入口有可信关联的实测道路覆盖率及
+  最大连通区域面积均需达标。每侧固定要求至少两票，并与拓扑分类同时成立。
+  辅助连接像素不参与投票；仅两票而缺少出口与封闭证据也不会发布转弯。
+- `stop_roi` 使用 128×90 参考坐标；`indicator_roi`、`indicator_min_area_reference` 保留读取兼容，
+  新路口规则使用两票及拓扑约束，顶部指示框不再作为回退分类入口。
+- `white_s_max` / `white_v_min`：白色候选的最大 S 和最小 V，初值 `45` / `170`，需按现场标定。
+- `occlusion_max_gap_fraction`：可关联白色间断的最大高度占 ROI 高度的比例，默认 `0.25`。
+  要求间断上下均有连续实测道路，宽度、中心位置及实测方向匹配，且间断内每行至少 80% 为白色候选。
+  更大的白色间断标为未知但不连接，不能把整片白色背景补成道路。
+- `geometry_min_span_fraction`：拟合点在纵向上至少覆盖 ROI 高度的比例，默认 `0.15`。
+  遮挡时可用至少三个真实有效块拟合，必须满足纵向跨度及残差约束；不能用连接像素生成中点。
+- 循迹块面积阈值按实际条带面积相对 128×7 参考条带缩放；停止区面积按处理分辨率缩放。
+- `road_lab`、`stop_lab`、固定 `scan_bands` 和单个 `left_marker_roi` / `right_marker_roi` 已移除，
+  遇到旧键会报错并提示迁移。主扫描条带直接覆盖完整 ROI，由 `--threads` 控制数量。
 
 不用靠心算确认：启动时 stderr 会打印一行解析结果，例如
 
@@ -230,13 +291,28 @@ geometry: input 1280x720, process 640x360, roi [26,86,1229,612] input px -> [13,
 固定相机后保存不同路况和光照下的 1280×720 原始 PNG，用图片模式的 `--overlay`、
 `--mask` 检查分割结果。拍摄显示器的照片只能辅助分析，不能替代相机颜色标定。
 候选从底部向上选择，优先选择靠近画面中心的道路，并要求与底部区域连通、上下位置连续。
-触及搜索窗口左右边界、只有单侧边缘的色块不提供中线；至少需要三个有效扫描带，
-且最底部必须有效。几何置信度同时考虑扫描带数量、区域完整度和直线拟合残差，
+触及搜索窗口左右边界、只有单侧边缘的色块不提供中线；至少需要半数且不少于三个有效扫描带，
+且最底部必须有效。已确认白色遮挡时，可关联上下道路，并在底部白色遮挡距离受限时从
+真实可见道路重新定位；距离限制同 `occlusion_max_gap_fraction`，不向白区生成外推点。
+道路只剩少量可见面积、跨度不足或距车辆过远时输出 `valid: false`。白色遮挡不作为前方封闭证据。
+几何置信度同时考虑扫描带数量、区域完整度和直线拟合残差，
 与路况分类置信度分别报告，两者都不是校准后的正确率概率。
 强反光、大片阴影或道路超出画面仍可能输出 `LOST`，应结合原始帧检查，避免只放宽阈值。
-停止区识别默认关闭；启用时使用配置的颜色范围，样例 B 通道反向范围已按 [-45,-9] 修正。
+停止区识别默认关闭；`stop_hsv` 提供红色初始范围，缺少停止区实拍样图，启用前需要现场标定。
 
 如需俯视变换，同时填写 `perspective_src` 与 `perspective_dst`，各为四个对应点，
 按左上、右上、右下、左下排序，坐标以原始 1280×720 图像为准。程序会自动缩放标定点。
-保持六个扫描带覆盖道路，并在最底部扫描带保留有效道路区域。接入底盘控制前，应在 X5
+扫描条带自动覆盖 ROI。接入底盘控制前，应在 X5
 实机上测量帧率，并用已标注图片检查误报、漏报及减速带遮挡时的 `UNKNOWN` 结果。
+
+## 现场标定顺序
+
+1. 使用 `--display --full-process --threads 4` 观察分区与三角框；相机位置固定后调整分区边界和六框位置。
+2. 按 S 保存原始帧，分别选取中央道路、左右暗侧道路和对应背景，标定 `road_hsv` 与共享 `side_road_hsv`。
+   以背景不误入为约束，不将整张白色减速带并入道路范围。
+3. 检查直道与左右转、T 字口的 `left_junction_hits/right_junction_hits`，确认一票不触发、两票仍需拓扑支持。
+4. 记录减速带接近、进入、遮挡最大、离开四个阶段；调整白色候选阈值和允许连接高度，检查橙色辅助连接
+   始终限于可验证的道路走廊，测量点只落在真实道路上。
+
+几乎看不到道路时程序输出几何无效；UART 格式不增加预测字段。连续通过此类遮挡需要控制端处理无效几何，
+或结合里程计、IMU、调整相机视角。当前仓库没有新的现场减速带原图，白色与侧区参数是待现场验证的初值。

@@ -4,53 +4,49 @@ input_width: 1280
 input_height: 720
 process_width: 640
 
-# Steering search window in original-image pixels. Junction topology searches
-# the same horizontal range over the full image height. Scan bands below use
-# an independent 128x90 reference coordinate system.
+# Input-image pixels. The complete ROI is split into --threads * 6 strips.
 roi: [0, 360, 1280, 360]
-
-# Learn road/floor color contrast when available, including reflective roads.
-# Otherwise use row/frame brightness to retain full-width junction crossbars.
-segmentation_mode: adaptive_dark
+segmentation_mode: hsv
+# OpenCV HSV [Hmin,Hmax,Smin,Smax,Vmin,Vmax]. H: 0..179, S/V: 0..255.
+# A reversed H interval wraps through zero. Calibrate for the actual camera.
+road_hsv: [80, 135, 10, 150, 40, 230]
+# Both dark sides share this optional range. Omit to inherit road_hsv.
+# Initial value only: calibrate road AND floor pixels under the actual light.
+side_road_hsv: [80, 135, 10, 150, 40, 230]
+side_left_end_reference: 36
+side_right_begin_reference: 92
+marker_min_coverage: 0.35
+white_s_max: 45
+white_v_min: 170
+occlusion_max_gap_fraction: 0.25
+geometry_min_span_fraction: 0.15
 road_contrast_min: 18
 min_road_width_fraction: 0.06
 max_road_width_fraction: 0.85
-
-# Video only: publish a new measured type immediately, matching STM32's
-# single-report corner latch. Geometry smoothing and dropout hold are separate.
 classification_confirm_frames: 1
 classification_hold_frames: 2
 geometry_smoothing_alpha: 0.35
-
-# Used only with segmentation_mode: lab. OpenCV 8-bit Lab bounds:
-# [Lmin,Lmax,amin,amax,bmin,bmax].
-road_lab: [133, 171, 124, 148, 123, 138]
 morphology_pixels: 3
 min_blob_area_reference: 10
 
-# Sample's six lower-road scan strips, in 128x90 reference pixels.
-scan_bands:
-  - [0, 42, 128, 7]
-  - [0, 49, 128, 7]
-  - [0, 56, 128, 7]
-  - [0, 63, 128, 7]
-  - [0, 70, 128, 7]
-  - [0, 77, 128, 7]
-
-# The top black region gates the left/right white marker checks.
+# Event rectangles in 128x90 reference pixels: outer, inner-upper, inner-lower.
 indicator_roi: [50, 34, 28, 30]
 indicator_min_area_reference: 53
-left_marker_roi: [10, 50, 10, 10]
-right_marker_roi: [108, 50, 10, 10]
+left_marker_rois:
+  - [10, 38, 10, 10]
+  - [24, 28, 10, 10]
+  - [24, 48, 10, 10]
+right_marker_rois:
+  - [108, 38, 10, 10]
+  - [94, 28, 10, 10]
+  - [94, 48, 10, 10]
 
-# Stop-zone recognition is opt-in. The sample's reversed B bounds are corrected
-# to [-45,-9] before translating to OpenCV's 8-bit Lab coordinates.
+# Initial red range only; no stop-zone camera fixture is available for calibration.
 stop_detection_enabled: 0
 stop_roi: [50, 50, 28, 7]
-stop_lab: [51, 135, 149, 193, 83, 119]
+stop_hsv: [170, 10, 100, 255, 80, 255]
 stop_min_area_reference: 53
 
-# Add both point sets to enable a perspective transform. Coordinates use the
-# original input frame and must be ordered TL, TR, BR, BL.
+# Optional perspective transform, original-input pixels ordered TL, TR, BR, BL.
 # perspective_src: [[430, 120], [930, 120], [1220, 700], [60, 700]]
 # perspective_dst: [[400, 120], [880, 120], [880, 700], [400, 700]]

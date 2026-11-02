@@ -44,14 +44,14 @@ void expectType(const cv::Mat& mask, road_finder::RoadType expected,
   require(result.centerline.size() >= 2, "missing fitted centerline points");
 }
 
-road_finder::LabRange rangeFor(cv::Scalar bgr) {
+road_finder::HsvRange rangeFor(cv::Scalar bgr) {
   cv::Mat pixel(1, 1, CV_8UC3, bgr);
-  cv::Mat lab;
-  cv::cvtColor(pixel, lab, cv::COLOR_BGR2Lab);
-  const cv::Vec3b value = lab.at<cv::Vec3b>(0, 0);
+  cv::Mat hsv;
+  cv::cvtColor(pixel, hsv, cv::COLOR_BGR2HSV);
+  const cv::Vec3b value = hsv.at<cv::Vec3b>(0, 0);
   const auto lower = [](int channel) { return std::max(0, channel - 3); };
   const auto upper = [](int channel) { return std::min(255, channel + 3); };
-  return {lower(value[0]), upper(value[0]), lower(value[1]), upper(value[1]),
+  return {lower(value[0]), std::min(179, upper(value[0])), lower(value[1]), upper(value[1]),
           lower(value[2]), upper(value[2])};
 }
 
@@ -91,10 +91,12 @@ void expectSampleBandGeometry() {
 
 void expectMarkerClassification() {
   cv::Mat left = stem();
+  left.rowRange(0, 95).setTo(0);
   cv::rectangle(left, {80, 95}, {320, 215}, cv::Scalar(255), cv::FILLED);
   expectType(left, road_finder::RoadType::LEFT_TURN, road_finder::LEFT);
 
   cv::Mat right = stem();
+  right.rowRange(0, 95).setTo(0);
   cv::rectangle(right, {320, 95}, {560, 215}, cv::Scalar(255), cv::FILLED);
   expectType(right, road_finder::RoadType::RIGHT_TURN, road_finder::RIGHT);
 
@@ -105,7 +107,7 @@ void expectMarkerClassification() {
              road_finder::LEFT | road_finder::RIGHT);
 }
 
-void expectLabSegmentationAndStopGate() {
+void expectHSVSegmentationAndStopGate() {
   const cv::Scalar background(185, 195, 200);
   const cv::Scalar road(150, 140, 130);
   const cv::Scalar stop(20, 40, 220);
@@ -114,8 +116,8 @@ void expectLabSegmentationAndStopGate() {
   cv::rectangle(frame, {550, 400}, {650, 475}, stop, cv::FILLED);
 
   road_finder::Config config = testConfig();
-  config.road_lab = rangeFor(road);
-  config.stop_lab = rangeFor(stop);
+  config.road_hsv = rangeFor(road);
+  config.stop_hsv = rangeFor(stop);
   road_finder::RoadDetector default_detector(config);
   const auto default_result = default_detector.process(frame, 7);
   require(default_result.valid && default_result.type == road_finder::RoadType::STRAIGHT,
@@ -539,8 +541,8 @@ void expectTemporalStability() {
           "a sustained junction must be confirmed after three video frames");
   cv::Mat blank = cv::Mat::zeros(360, 640, CV_8UC1);
   const auto gap = observe(blank);
-  require(gap.type == road_finder::RoadType::T_JUNCTION && !gap.valid && gap.centerline.empty(),
-          "a brief dropout may retain the junction label but never stale steering");
+  require(gap.type == road_finder::RoadType::UNKNOWN && !gap.valid && gap.centerline.empty(),
+          "a junction without current two-box votes must clear immediately");
   observe(blank);
   require(observe(blank).type == road_finder::RoadType::UNKNOWN,
           "held classifications must expire after the configured dropout limit");
@@ -585,7 +587,7 @@ void expectStopDuringJunctionDropout() {
   config.classification_hold_frames = 2;
   config.stop_detection_enabled = true;
   const cv::Scalar stop(20, 40, 220);
-  config.stop_lab = rangeFor(stop);
+  config.stop_hsv = rangeFor(stop);
   road_finder::RoadDetector detector(config);
   cv::Mat frame(720, 1280, CV_8UC3, cv::Scalar(220, 225, 230));
   cv::Mat mask;
@@ -608,7 +610,7 @@ int main() {
   try {
     expectSampleBandGeometry();
     expectMarkerClassification();
-    expectLabSegmentationAndStopGate();
+    expectHSVSegmentationAndStopGate();
     expectPerspectiveAndFrameValidation();
     expectDistractorsRejected();
     expectAdaptiveDarkRoad();

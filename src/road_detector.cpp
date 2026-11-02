@@ -1,4 +1,6 @@
 #include "road_finder/road_detector.hpp"
+#include "worker_pool.hpp"
+#include "occlusion.hpp"
 
 #include <opencv2/core/version.hpp>
 #include <opencv2/imgproc.hpp>
@@ -26,11 +28,11 @@ void readValue(const cv::FileNode& node, const char* key, T& value) {
   if (!node[key].empty()) node[key] >> value;
 }
 
-LabRange readLabRange(const cv::FileNode& node, const LabRange& fallback, const char* key) {
+HsvRange readHsvRange(const cv::FileNode& node, const HsvRange& fallback, const char* key) {
   if (node.empty()) return fallback;
   if (node.size() != 6)
     throw std::runtime_error(std::string(key) +
-                             " needs [L_min,L_max,a_min,a_max,b_min,b_max]");
+                             " needs [H_min,H_max,S_min,S_max,V_min,V_max]");
   return {static_cast<int>(node[0]), static_cast<int>(node[1]),
           static_cast<int>(node[2]), static_cast<int>(node[3]),
           static_cast<int>(node[4]), static_cast<int>(node[5])};
@@ -66,13 +68,14 @@ std::array<cv::Point2f, 4> readPoints(const cv::FileNode& node) {
   return points;
 }
 
-bool validLabRange(const LabRange& range) {
+bool validHsvRange(const HsvRange& range) {
   const auto inByteRange = [](int value) { return value >= 0 && value <= 255; };
-  return inByteRange(range.l_min) && inByteRange(range.l_max) &&
-         inByteRange(range.a_min) && inByteRange(range.a_max) &&
-         inByteRange(range.b_min) && inByteRange(range.b_max) &&
-         range.l_min <= range.l_max && range.a_min <= range.a_max &&
-         range.b_min <= range.b_max;
+  return (range.h_min >= 0 && range.h_min <= 179) &&
+         (range.h_max >= 0 && range.h_max <= 179) &&
+         inByteRange(range.s_min) && inByteRange(range.s_max) &&
+         inByteRange(range.v_min) && inByteRange(range.v_max) &&
+         range.s_min <= range.s_max &&
+         range.v_min <= range.v_max;
 }
 
 cv::Rect scaleReferenceRect(const cv::Rect& reference, cv::Size size) {
@@ -138,15 +141,14 @@ Blob largestBlob(const cv::Mat& binary, cv::Rect roi, bool foreground,
 
 // Select the road from the vehicle outward. A blob touching a search boundary
 // has only one measured edge and cannot provide a reliable road center.
-Blob roadBlob(const cv::Mat& mask, const cv::Mat& support, const cv::Rect& band, int min_area,
-              const Config& config, float expected_x, float max_step) {
+std::vector<Blob> roadCandidates(const cv::Mat& mask, const cv::Mat& support,
+                                 const cv::Rect& band, int min_area, const Config& config) {
   if (band.empty()) return {};
   cv::Mat selected, labels, stats, centroids;
   cv::compare(mask(band), cv::Scalar(0), selected, cv::CMP_GT);
   const int count = cv::connectedComponentsWithStats(
       selected, labels, stats, centroids, 8, CV_32S);
-  Blob best;
-  float best_score = std::numeric_limits<float>::max();
+  std::vector<Blob> candidates;
   for (int label = 1; label < count; ++label) {
     const int area = stats.at<int>(label, cv::CC_STAT_AREA);
     const int x = stats.at<int>(label, cv::CC_STAT_LEFT);
@@ -158,18 +160,27 @@ Blob roadBlob(const cv::Mat& mask, const cv::Mat& support, const cv::Rect& band,
       continue;
     const float center_x = static_cast<float>(centroids.at<double>(label, 0) + band.x);
     const int center_y = cvRound(centroids.at<double>(label, 1) + band.y);
+    if (!mask.at<unsigned char>(center_y, cvRound(center_x))) continue;
     if (!support.at<unsigned char>(center_y, x + band.x - 1) ||
         !support.at<unsigned char>(center_y, x + band.x + width))
       continue;
-    const float distance = std::abs(center_x - expected_x);
-    if (distance > max_step) continue;
-    const float fill = static_cast<float>(area) / (width * height);
-    const float score = distance / mask.cols + 0.1f * (1.0f - fill);
-    if (score >= best_score) continue;
-    best_score = score;
-    best = {true, area,
+    candidates.push_back({true, area,
             {x + band.x, stats.at<int>(label, cv::CC_STAT_TOP) + band.y, width, height},
-            {center_x, static_cast<float>(centroids.at<double>(label, 1) + band.y)}};
+            {center_x, static_cast<float>(centroids.at<double>(label, 1) + band.y)}});
+  }
+  return candidates;
+}
+
+Blob selectRoad(const std::vector<Blob>& candidates, float expected_x, float max_step,
+                int width) {
+  Blob best;
+  float best_score = std::numeric_limits<float>::max();
+  for (const Blob& candidate : candidates) {
+    const float distance = std::abs(candidate.center.x - expected_x);
+    if (distance > max_step) continue;
+    const float fill = static_cast<float>(candidate.area) / candidate.bounds.area();
+    const float score = distance / width + 0.1f * (1.0f - fill);
+    if (score < best_score) { best_score = score; best = candidate; }
   }
   return best;
 }
@@ -262,7 +273,7 @@ RoadChroma estimateRoadChroma(const cv::Mat& bgr, const cv::Mat& gray,
 
 cv::Mat adaptiveDarkMask(const cv::Mat& bgr, const cv::Mat& valid,
                          const cv::Rect& roi, int minimum_contrast) {
-  // Grayscale avoids the costly Lab conversion on the board. A frame-level
+  // The adaptive fallback works in grayscale. A frame-level
   // reference keeps a full-width crossbar visible when a row has no floor.
   cv::Mat gray;
   cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
@@ -364,16 +375,21 @@ struct Junction {
 
 // A junction needs an incoming stem, wider connected lateral exits, and a
 // blocked forward path. Image-edge contact is allowed for the crossbar only.
-Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
+Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi,
+                          const cv::Mat& unknown) {
   cv::Mat labels, stats, centroids;
   const int count = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8, CV_32S);
   const cv::Rect anchor = cv::Rect(mask.cols * 3 / 8, mask.rows * 4 / 5,
                                   mask.cols / 4, std::max(1, mask.rows / 6)) & roi;
   if (anchor.empty()) return {};
   std::vector<int> hits(count, 0);
+  std::vector<std::int64_t> anchor_x_sums(count, 0);
   for (int y = anchor.y; y < anchor.y + anchor.height; ++y)
-    for (int x = anchor.x; x < anchor.x + anchor.width; ++x)
-      ++hits[labels.at<int>(y, x)];
+    for (int x = anchor.x; x < anchor.x + anchor.width; ++x) {
+      const int label = labels.at<int>(y, x);
+      ++hits[label];
+      anchor_x_sums[label] += x;
+    }
   int best = 0;
   int best_hits = 0;
   for (int label = 1; label < count; ++label)
@@ -388,7 +404,7 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
   // in the outer corners. For T-only closure, measure forward road inside a
   // narrow inset; a real exit retaining measurable interior width stays open.
   const int forward_inset = std::max(1, cvRound(roi.width * 0.05));
-  const int center = cvRound(centroids.at<double>(best, 0));
+  const int center = cvRound(static_cast<double>(anchor_x_sums[best]) / hits[best]);
   for (int y = 0; y < mask.rows; ++y) {
     const int* row = labels.ptr<int>(y);
     Span closest;
@@ -468,6 +484,14 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
     max_left = std::max(max_left, left_run);
     max_right = std::max(max_right, right_run);
     max_both = std::max(max_both, both_run);
+    // Unknown white inside a supported road corridor is not a closed exit.
+    const cv::Rect forward_probe(std::max(roi.x, neck_left), y,
+        std::min(roi.x + roi.width, neck_right + 1) - std::max(roi.x, neck_left), 1);
+    if (cv::countNonZero(unknown(forward_probe)) > forward_probe.width * 0.25f) {
+      closed_rows = t_closed_rows = 0;
+      max_left = max_right = max_both = 0;
+      continue;
+    }
     // Leaving the bottom stem's fixed x coordinate is not a blocked road.
     // A slanted or flared forward lane may still continue elsewhere in the
     // same connected component, all the way to the top of the image.
@@ -502,13 +526,27 @@ Junction classifyJunction(const cv::Mat& mask, const cv::Rect& roi) {
   return {};
 }
 
-cv::Mat labMask(const cv::Mat& bgr, const LabRange& range) {
-  cv::Mat lab, mask;
-  cv::cvtColor(bgr, lab, cv::COLOR_BGR2Lab);
-  cv::inRange(lab,
-              cv::Scalar(range.l_min, range.a_min, range.b_min),
-              cv::Scalar(range.l_max, range.a_max, range.b_max), mask);
+cv::Mat hsvMask(const cv::Mat& bgr, const HsvRange& range) {
+  cv::Mat hsv, mask;
+  cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
+  const auto threshold = [&](int low, int high, cv::Mat& output) {
+    cv::inRange(hsv, cv::Scalar(low, range.s_min, range.v_min),
+                cv::Scalar(high, range.s_max, range.v_max), output);
+  };
+  if (range.h_min <= range.h_max) threshold(range.h_min, range.h_max, mask);
+  else {
+    cv::Mat upper;
+    threshold(0, range.h_max, mask);
+    threshold(range.h_min, 179, upper);
+    cv::bitwise_or(mask, upper, mask);
+  }
   return mask;
+}
+
+bool junctionVotesSupport(RoadType type, const RoadResult& result) {
+  const unsigned directions = directionsFor(type);
+  return (!(directions & LEFT) || result.left_junction_hits >= 2) &&
+         (!(directions & RIGHT) || result.right_junction_hits >= 2);
 }
 
 void rejectDeprecatedKeys(const cv::FileNode& root, const Config& config) {
@@ -535,6 +573,13 @@ Config loadConfig(const std::string& path) {
 
   Config config;
   const cv::FileNode root = fs.root();
+  for (const char* key : {"road_lab", "stop_lab", "scan_bands", "left_marker_roi",
+                          "right_marker_roi"}) {
+    if (!root[key].empty())
+      throw std::runtime_error(std::string(key) +
+          " is no longer supported: use road_hsv/stop_hsv, left_marker_rois/"
+          "right_marker_rois; scan bands are generated from ROI and --threads");
+  }
   readValue(root, "input_width", config.input_width);
   readValue(root, "input_height", config.input_height);
   readValue(root, "process_width", config.process_width);
@@ -552,24 +597,28 @@ Config loadConfig(const std::string& path) {
   int stop_enabled = config.stop_detection_enabled ? 1 : 0;
   readValue(root, "stop_detection_enabled", stop_enabled);
   config.stop_detection_enabled = stop_enabled != 0;
-  config.road_lab = readLabRange(root["road_lab"], config.road_lab, "road_lab");
-  config.stop_lab = readLabRange(root["stop_lab"], config.stop_lab, "stop_lab");
+  config.road_hsv = readHsvRange(root["road_hsv"], config.road_hsv, "road_hsv");
+  if (!root["side_road_hsv"].empty())
+    config.side_road_hsv = readHsvRange(root["side_road_hsv"], config.road_hsv, "side_road_hsv");
+  readValue(root, "side_left_end_reference", config.side_left_end_reference);
+  readValue(root, "side_right_begin_reference", config.side_right_begin_reference);
+  readValue(root, "marker_min_coverage", config.marker_min_coverage);
+  readValue(root, "white_s_max", config.white_s_max);
+  readValue(root, "white_v_min", config.white_v_min);
+  readValue(root, "occlusion_max_gap_fraction", config.occlusion_max_gap_fraction);
+  readValue(root, "geometry_min_span_fraction", config.geometry_min_span_fraction);
+  config.stop_hsv = readHsvRange(root["stop_hsv"], config.stop_hsv, "stop_hsv");
   config.indicator_roi = readRect(root["indicator_roi"], "indicator_roi", config.indicator_roi);
-  config.left_marker_roi = readRect(root["left_marker_roi"], "left_marker_roi",
-                                    config.left_marker_roi);
-  config.right_marker_roi = readRect(root["right_marker_roi"], "right_marker_roi",
-                                     config.right_marker_roi);
+  const auto readMarkers = [&](const char* key, std::array<cv::Rect, 3>& regions) {
+    const cv::FileNode node = root[key];
+    if (node.empty()) return;
+    if (node.size() != 3) throw std::runtime_error(std::string(key) + " needs three rectangles");
+    for (int i = 0; i < 3; ++i) regions[i] = readRect(node[i], key, regions[i]);
+  };
+  readMarkers("left_marker_rois", config.left_marker_rois);
+  readMarkers("right_marker_rois", config.right_marker_rois);
   config.stop_roi = readRect(root["stop_roi"], "stop_roi", config.stop_roi);
   config.roi = readRect(root["roi"], "roi", config.roi);
-
-  const cv::FileNode bands = root["scan_bands"];
-  if (!bands.empty()) {
-    if (bands.size() != config.scan_bands.size())
-      throw std::runtime_error("scan_bands needs six [x,y,width,height] entries");
-    for (std::size_t i = 0; i < config.scan_bands.size(); ++i)
-      config.scan_bands[i] = readRect(bands[static_cast<int>(i)], "scan_bands entry",
-                                      config.scan_bands[i]);
-  }
 
   const cv::FileNode src = root["perspective_src"];
   const cv::FileNode dst = root["perspective_dst"];
@@ -599,10 +648,24 @@ void validateConfig(const Config& config) {
     throw std::runtime_error("roi must stay inside the input image");
   if (config.roi.y + config.roi.height < static_cast<int>(0.8 * config.input_height))
     throw std::runtime_error("roi must reach at least 80% of the input height");
-  if (!validLabRange(config.road_lab) || !validLabRange(config.stop_lab))
-    throw std::runtime_error("invalid Lab range: values must be ordered and within [0,255]");
-  if (config.segmentation_mode != "lab" && config.segmentation_mode != "adaptive_dark")
-    throw std::runtime_error("segmentation_mode must be lab or adaptive_dark");
+  if (!validHsvRange(config.road_hsv) || !validHsvRange(config.stop_hsv) ||
+      (config.side_road_hsv && !validHsvRange(*config.side_road_hsv)))
+    throw std::runtime_error("invalid HSV range: H within [0,179], ordered S/V within [0,255]");
+  if (config.side_left_end_reference <= 0 ||
+      config.side_right_begin_reference >= kReferenceWidth ||
+      config.side_left_end_reference >= config.side_right_begin_reference)
+    throw std::runtime_error("side region boundaries must satisfy 0 < left < right < 128");
+  const auto fraction = [](float value) {
+    return std::isfinite(value) && value > 0.0f && value <= 1.0f;
+  };
+  if (!fraction(config.marker_min_coverage) || !fraction(config.occlusion_max_gap_fraction) ||
+      !fraction(config.geometry_min_span_fraction))
+    throw std::runtime_error("coverage, gap and geometry span fractions must be within (0,1]");
+  if (config.white_s_max < 0 || config.white_s_max > 255 ||
+      config.white_v_min < 0 || config.white_v_min > 255)
+    throw std::runtime_error("white thresholds must be within [0,255]");
+  if (config.segmentation_mode != "hsv" && config.segmentation_mode != "adaptive_dark")
+    throw std::runtime_error("segmentation_mode must be hsv or adaptive_dark; migrate lab thresholds to HSV");
   if (config.road_contrast_min < 1 || config.road_contrast_min > 255)
     throw std::runtime_error("road_contrast_min must be within [1,255]");
   if (!std::isfinite(config.min_road_width_fraction) ||
@@ -627,14 +690,14 @@ void validateConfig(const Config& config) {
            roi.x + roi.width <= kReferenceWidth &&
            roi.y + roi.height <= kReferenceHeight;
   };
-  for (const cv::Rect& band : config.scan_bands)
-    if (!validReferenceRect(band))
-      throw std::runtime_error("each scan_bands ROI must fit inside the 128x90 reference image");
-  if (!validReferenceRect(config.indicator_roi) ||
-      !validReferenceRect(config.left_marker_roi) ||
-      !validReferenceRect(config.right_marker_roi) ||
-      !validReferenceRect(config.stop_roi))
-    throw std::runtime_error("marker and stop ROIs must fit inside the 128x90 reference image");
+  if (config.threads < 1 || config.threads > std::numeric_limits<int>::max() / 6)
+    throw std::runtime_error("threads must be positive and threads * 6 must fit in an integer");
+  for (const auto& side : {config.left_marker_rois, config.right_marker_rois})
+    for (const auto& region : side)
+      if (!validReferenceRect(region))
+        throw std::runtime_error("marker ROIs must fit inside the 128x90 reference image");
+  if (!validReferenceRect(config.indicator_roi) || !validReferenceRect(config.stop_roi))
+    throw std::runtime_error("indicator and stop ROIs must fit inside the 128x90 reference image");
 
   if (config.use_perspective) {
     std::vector<cv::Point2f> src(config.perspective_src.begin(), config.perspective_src.end());
@@ -728,12 +791,30 @@ RoadDetector::RoadDetector(Config config) : config_(std::move(config)) {
     roi_polygon_.emplace_back(point.x / sx, point.y / sy);
 
   const cv::Size process_size(width, height);
-  for (std::size_t i = 0; i < scan_bands_processed_.size(); ++i)
-    scan_bands_processed_[i] = scaleReferenceRect(config_.scan_bands[i], process_size);
+  const int count = config_.threads * 6;
+  if (count > roi_processed_.height)
+    throw std::runtime_error("threads * 6 exceeds the processed ROI height");
+  for (int i = 0; i < count; ++i) {
+    const int top = roi_processed_.y + static_cast<int>(static_cast<std::int64_t>(i) * roi_processed_.height / count);
+    const int bottom = roi_processed_.y + static_cast<int>(static_cast<std::int64_t>(i + 1) * roi_processed_.height / count);
+    scan_bands_processed_.emplace_back(roi_processed_.x, top, roi_processed_.width, bottom - top);
+  }
   indicator_roi_processed_ = scaleReferenceRect(config_.indicator_roi, process_size);
-  left_marker_roi_processed_ = scaleReferenceRect(config_.left_marker_roi, process_size);
-  right_marker_roi_processed_ = scaleReferenceRect(config_.right_marker_roi, process_size);
+  for (int i = 0; i < 3; ++i) {
+    marker_rois_processed_[i] = scaleReferenceRect(config_.left_marker_rois[i], process_size);
+    marker_rois_processed_[i + 3] = scaleReferenceRect(config_.right_marker_rois[i], process_size);
+  }
   stop_roi_processed_ = scaleReferenceRect(config_.stop_roi, process_size);
+  workers_ = std::make_unique<WorkerPool>(config_.threads);
+}
+
+RoadDetector::~RoadDetector() = default;
+
+std::vector<cv::Point2f> RoadDetector::sourcePolygon(const cv::Rect& rect) const {
+  return {sourcePoint({static_cast<float>(rect.x), static_cast<float>(rect.y)}),
+          sourcePoint({static_cast<float>(rect.x + rect.width), static_cast<float>(rect.y)}),
+          sourcePoint({static_cast<float>(rect.x + rect.width), static_cast<float>(rect.y + rect.height)}),
+          sourcePoint({static_cast<float>(rect.x), static_cast<float>(rect.y + rect.height)})};
 }
 
 void RoadDetector::prepareView(const cv::Mat& bgr, cv::Mat& processed,
@@ -751,9 +832,19 @@ cv::Mat RoadDetector::segment(const cv::Mat& view) const {
   cv::Mat blurred;
   const int blur_size = config_.segmentation_mode == "adaptive_dark" ? 5 : 3;
   cv::GaussianBlur(view, blurred, cv::Size(blur_size, blur_size), 0);
-  cv::Mat mask = config_.segmentation_mode == "adaptive_dark"
-      ? adaptiveDarkMask(blurred, valid_view_mask_, roi_processed_, config_.road_contrast_min)
-      : labMask(blurred, config_.road_lab);
+  cv::Mat mask;
+  if (config_.segmentation_mode == "adaptive_dark") {
+    mask = adaptiveDarkMask(blurred, valid_view_mask_, roi_processed_, config_.road_contrast_min);
+  } else {
+    mask = hsvMask(blurred, config_.road_hsv);
+    if (config_.side_road_hsv) {
+      const cv::Mat side_mask = hsvMask(blurred, *config_.side_road_hsv);
+      const int left = cvRound(view.cols * config_.side_left_end_reference / 128.0);
+      const int right = cvRound(view.cols * config_.side_right_begin_reference / 128.0);
+      side_mask.colRange(0, left).copyTo(mask.colRange(0, left));
+      side_mask.colRange(right, mask.cols).copyTo(mask.colRange(right, mask.cols));
+    }
+  }
   const int kernel_size = config_.morphology_pixels | 1;
   const cv::Mat kernel = cv::getStructuringElement(
       cv::MORPH_RECT, cv::Size(kernel_size, kernel_size));
@@ -800,14 +891,29 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   const cv::Rect image_bounds(0, 0, mask.cols, mask.rows);
   const cv::Size process_size(mask.cols, mask.rows);
   const int minimum_area = scaledArea(config_.min_blob_area_reference, process_size);
-  const Junction junction = classifyJunction(mask, roi_processed_);
+  result.hsv_region_edges = {{
+      cvRound(mask.cols * config_.side_left_end_reference / 128.0),
+      cvRound(mask.cols * config_.side_right_begin_reference / 128.0)}};
+  result.white_mask = cv::Mat::zeros(mask.size(), CV_8UC1);
+  if (processed_bgr != nullptr) {
+    result.white_mask = hsvMask(*processed_bgr,
+        {0, 179, 0, config_.white_s_max, config_.white_v_min, 255});
+    cv::bitwise_and(result.white_mask, valid_view_mask_, result.white_mask);
+    result.white_mask.setTo(0, mask);  // A measured road pixel is never unknown.
+  }
+  const auto occlusion = findOcclusions(mask, result.white_mask, roi_processed_, config_);
+  result.occlusion_mask = occlusion.unknown;
+  result.bridge_mask = occlusion.bridges;
+  result.occlusion_detected = cv::countNonZero(result.occlusion_mask) > 0;
+  const bool geometry_occluded = cv::countNonZero(result.occlusion_mask(roi_processed_)) > 0;
+  const Junction junction = classifyJunction(mask, roi_processed_, result.occlusion_mask);
   result.type = junction.type;
   result.available_directions = directionsFor(junction.type);
   result.classification_confidence = junction.confidence;
   if (processed_bgr != nullptr && config_.stop_detection_enabled) {
     cv::Mat stop_blurred;
     cv::GaussianBlur(*processed_bgr, stop_blurred, cv::Size(3, 3), 0);
-    const cv::Mat stop_mask = labMask(stop_blurred, config_.stop_lab);
+    const cv::Mat stop_mask = hsvMask(stop_blurred, config_.stop_hsv);
     const int stop_area = scaledArea(config_.stop_min_area_reference, process_size);
     result.stop_detected = largestBlob(stop_mask, stop_roi_processed_, true, stop_area).found;
     if (result.stop_detected) {
@@ -817,39 +923,125 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
     }
   }
 
-  std::array<Blob, 6> samples{};
+  const int block_count = static_cast<int>(scan_bands_processed_.size());
+  std::vector<Blob> samples(block_count);
+  result.scan_blocks.resize(block_count);
+  const auto blockArea = [&](int i) {
+    const cv::Rect& band = scan_bands_processed_[i];
+    return std::max(1, cvRound(config_.min_blob_area_reference *
+        static_cast<double>(band.area()) / (kReferenceWidth * 7)));
+  };
+  for (int i = 0; i < block_count; ++i) {
+    result.scan_blocks[i].processed_region = scan_bands_processed_[i];
+    result.scan_blocks[i].polygon = sourcePolygon(scan_bands_processed_[i]);
+  }
+  const Blob bottom = selectRoad(roadCandidates(mask, valid_view_mask_,
+      scan_bands_processed_.back(), blockArea(block_count - 1), config_),
+      mask.cols / 2.0f, mask.cols * 0.5f, mask.cols);
+  Blob seed = bottom;
+  bool geometry_anchor = bottom.found;
+  if (bottom.found && geometry_occluded &&
+      roi_processed_.y + roi_processed_.height - bottom.bounds.y - bottom.bounds.height >
+          config_.occlusion_max_gap_fraction * roi_processed_.height)
+    geometry_anchor = false;
+  if (!seed.found && geometry_occluded) {
+    // Reacquire from actual visible road only when white explains the missing
+    // bottom. Limit distance to the vehicle; no long-range extrapolation.
+    for (int i = block_count - 2; i >= 0; --i) {
+      const Blob candidate = selectRoad(roadCandidates(mask, valid_view_mask_,
+          scan_bands_processed_[i], blockArea(i), config_),
+          mask.cols / 2.0f, mask.cols * 0.5f, mask.cols);
+      if (!candidate.found) continue;
+      const int end = candidate.bounds.y + candidate.bounds.height;
+      if (roi_processed_.y + roi_processed_.height - end <=
+          config_.occlusion_max_gap_fraction * roi_processed_.height) {
+        const cv::Rect gap(candidate.bounds.x, end, candidate.bounds.width,
+                           roi_processed_.y + roi_processed_.height - end);
+        if (gap.area() > 0 && cv::countNonZero(result.occlusion_mask(gap)) >= 0.8f * gap.area()) {
+          seed = candidate;
+          geometry_anchor = true;
+        }
+      }
+      break;
+    }
+  }
+  if (!seed.found) {
+    const cv::Rect anchor = cv::Rect(mask.cols * 3 / 8, mask.rows * 4 / 5,
+        mask.cols / 4, std::max(1, mask.rows / 6)) & roi_processed_;
+    seed = largestBlob(mask, anchor, true, minimum_area);
+  }
+  cv::Mat association_mask;
+  cv::bitwise_or(mask, result.bridge_mask, association_mask);
+  cv::Mat tracking_mask = seed.found ? connectedRoad(association_mask, seed)
+      : cv::Mat::zeros(mask.size(), CV_8UC1);
+  cv::bitwise_and(tracking_mask, mask, tracking_mask);  // Measurements only.
+  std::vector<std::vector<Blob>> candidates(block_count);
+  workers_->run(block_count + 6, [&](int i) {
+    if (i < block_count) {
+      candidates[i] = roadCandidates(tracking_mask, valid_view_mask_,
+                                     scan_bands_processed_[i], blockArea(i), config_);
+    } else {
+      const int index = i - block_count;
+      auto& observation = result.junction_blocks[index];
+      const cv::Rect region = marker_rois_processed_[index] & image_bounds;
+      observation.processed_region = region;
+      observation.polygon = sourcePolygon(region);
+      observation.coverage = region.empty() ? 0.0f :
+          static_cast<float>(cv::countNonZero(tracking_mask(region))) / region.area();
+      const int required_area = std::max(minimum_area,
+          static_cast<int>(std::ceil(config_.marker_min_coverage * region.area())));
+      observation.found = seed.found && !result.stop_detected &&
+          observation.coverage >= config_.marker_min_coverage &&
+          largestBlob(tracking_mask, region, true, required_area).found;
+    }
+  });
+  for (int i = 0; i < 3; ++i) {
+    result.left_junction_hits += result.junction_blocks[i].found ? 1 : 0;
+    result.right_junction_hits += result.junction_blocks[i + 3].found ? 1 : 0;
+  }
+  if (!junctionVotesSupport(result.type, result)) {
+    result.type = RoadType::UNKNOWN;
+    result.available_directions = 0;
+    result.classification_confidence = 0.0f;
+  }
+  if (!geometry_anchor) return result;
   int valid_samples = 0;
   std::vector<int> widths_reference;
   widths_reference.reserve(samples.size());
   float expected_x = mask.cols / 2.0f;
-  int previous_band = static_cast<int>(samples.size());
-  cv::Mat tracking_mask = mask;
-  for (int i = static_cast<int>(samples.size()) - 1; i >= 0; --i) {
-    cv::Rect band = (scan_bands_processed_[i] & roi_processed_) & image_bounds;
-    // Permit one missing strip, but never jump across several unobserved bands.
-    if (previous_band - i > 2) break;
+  int previous_band = block_count;
+  const float reference_band_height = mask.rows * 7.0f / kReferenceHeight;
+  for (int i = block_count - 1; i >= 0; --i) {
+    if (valid_samples > 0 && previous_band - i > 2 &&
+        cv::countNonZero(result.bridge_mask(cv::Rect(roi_processed_.x,
+            scan_bands_processed_[i].y, roi_processed_.width,
+            scan_bands_processed_[previous_band].y - scan_bands_processed_[i].y))) == 0)
+      break;
+    const float distance_y = valid_samples == 0 ? 0.0f :
+        samples[previous_band].center.y -
+        (scan_bands_processed_[i].y + scan_bands_processed_[i].height * 0.5f);
     const float max_step = valid_samples == 0 ? mask.cols * 0.5f
-        : mask.cols * 0.12f * (previous_band - i);
-    samples[i] = roadBlob(tracking_mask, valid_view_mask_, band, minimum_area,
-                           config_, expected_x, max_step);
-    if (i == static_cast<int>(samples.size()) - 1 && !samples[i].found) return result;
+        : std::max(2.0f, mask.cols * 0.12f * distance_y / reference_band_height);
+    samples[i] = selectRoad(candidates[i], expected_x, max_step, mask.cols);
     if (!samples[i].found) continue;
-    if (valid_samples == 0) tracking_mask = connectedRoad(mask, samples[i]);
+    result.scan_blocks[i].found = true;
+    result.scan_blocks[i].midpoint = sourcePoint(samples[i].center);
     expected_x = samples[i].center.x;
     previous_band = i;
     ++valid_samples;
     const double sx = static_cast<double>(mask.cols) / kReferenceWidth;
     widths_reference.push_back(std::max(1, cvRound(samples[i].bounds.width / sx)));
   }
-
-  // Require support across at least half the strips, including the bottom one.
-  if (valid_samples < 3 || !samples.back().found) return result;
+  const int required_samples = geometry_occluded ? 3 : std::max(3, (block_count + 1) / 2);
+  if (valid_samples < required_samples || (!geometry_occluded && !samples.back().found))
+    return result;
 
   std::vector<cv::Point2f> points;
   points.reserve(samples.size());
   for (const Blob& sample : samples)
     if (sample.found) points.push_back(sample.center);
-  if (points.size() < 2) return result;
+  if (points.size() < 3 || points.back().y - points.front().y <
+      config_.geometry_min_span_fraction * roi_processed_.height) return result;
 
   double mean_x = 0.0;
   double mean_y = 0.0;
@@ -867,11 +1059,9 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   }
   if (denominator <= 1e-6) return result;
   const double dx_dy = numerator / denominator;
-  result.heading_error_rad = static_cast<float>(std::atan(-dx_dy));
 
   const double sx = static_cast<double>(mask.cols) / kReferenceWidth;
-  const float bottom_x_reference =
-      static_cast<float>(samples.back().center.x / sx);
+  const float bottom_x_reference = points.back().x / sx;
   const float offset_reference = bottom_x_reference - kReferenceWidth / 2.0f;
   std::sort(widths_reference.begin(), widths_reference.end());
   const float median_width = static_cast<float>(widths_reference[widths_reference.size() / 2]);
@@ -888,6 +1078,12 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   const double fit_quality = 1.0 / (1.0 + rms / std::max(3.0, median_width * sx * 0.15));
   result.confidence = static_cast<float>(
       valid_samples / static_cast<double>(samples.size()) * fit_quality * fill_sum / valid_samples);
+  if (geometry_occluded && rms > std::max(3.0, median_width * sx * 0.2)) {
+    result.lateral_error = 0.0f;
+    result.confidence = 0.0f;
+    return result;
+  }
+  result.heading_error_rad = static_cast<float>(std::atan(-dx_dy));
   result.valid = true;
 
   // Expose the fitted centerline at the measured rows and the observed strip
@@ -903,22 +1099,10 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
         sourcePoint({static_cast<float>(samples[i].bounds.x + samples[i].bounds.width - 1), y}));
   }
 
-  bool left = false;
-  bool right = false;
-  // Legacy color-marker layouts remain available in calibrated Lab mode.
-  if (config_.segmentation_mode == "lab") {
-    const int indicator_area = scaledArea(config_.indicator_min_area_reference, process_size);
-    const Blob indicator = largestBlob(tracking_mask, indicator_roi_processed_, false, indicator_area);
-    if (indicator.found) {
-      left = largestBlob(tracking_mask, left_marker_roi_processed_, true, minimum_area).found;
-      right = largestBlob(tracking_mask, right_marker_roi_processed_, true, minimum_area).found;
-    }
-  }
-
-  if (junction.type == RoadType::UNKNOWN && !result.stop_detected) {
-    result.type = left && right ? RoadType::T_JUNCTION
-        : (left ? RoadType::LEFT_TURN : (right ? RoadType::RIGHT_TURN : RoadType::STRAIGHT));
-    result.available_directions = directionsFor(result.type);
+  if (junction.type == RoadType::UNKNOWN && !result.stop_detected &&
+      result.left_junction_hits < 2 && result.right_junction_hits < 2) {
+    result.type = RoadType::STRAIGHT;
+    result.available_directions = STRAIGHT;
     result.classification_confidence = result.confidence;
   }
   return result;
@@ -936,6 +1120,14 @@ void RoadDetector::stabilize(RoadResult& result) {
   has_previous_result_ = true;
   previous_timestamp_ms_ = result.timestamp_ms;
 
+  // A held junction must satisfy this frame's votes too, and occlusion cannot
+  // inherit a classification whose geometry/evidence disappeared.
+  if (!junctionVotesSupport(stable_type_, result) ||
+      (result.occlusion_detected && result.type == RoadType::UNKNOWN)) {
+    stable_type_ = pending_type_ = RoadType::UNKNOWN;
+    pending_frames_ = unsupported_frames_ = 0;
+    stable_classification_confidence_ = 0.0f;
+  }
   const RoadType observed = result.type;
   // An enabled stop gate clears a known type immediately; do not debounce it.
   const bool stop = result.stop_detected;

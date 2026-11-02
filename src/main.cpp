@@ -36,27 +36,29 @@ struct Options {
   double camera_fps = kDefaultCameraFps;
   double preview_scale = 1.0;  // < 1 shrinks the preview to cut display cost.
   double preview_fps = 0.0;    // > 0 redraws the preview at most that often.
-  int threads = 0;             // 0 leaves OpenCV's default thread count.
+  int threads = 1;             // Detector workers; ROI strips = threads * 6.
   int benchmark_frames = 0;    // > 0 exits after that many frames.
-  bool display = true;
+  bool display = false;
+  bool full_process = false;
   bool json = false;
   bool serial_enabled = true;
   bool serial_device_explicit = false;
 };
 
 void usage() {
-  std::cout << "road_fucker [--source /dev/video0|0|frame.png] [--config file] [--no-display] "
+  std::cout << "road_fucker [--source /dev/video0|0|frame.png] [--config file] [--display] [--full-process] "
                "[--json] [--camera-fourcc MJPG] [--camera-fps 30] [--preview-scale 1.0] "
                "[--preview-fps 0] [--threads N] [--benchmark frames] [--overlay file] "
                "[--mask file] [--serial-device /dev/ttyS1|--no-serial]\n"
                "Defaults: --source "
             << kDefaultSource << ", --config " << kDefaultConfig
-            << ", preview window open at full size, no JSON output, UART "
+            << ", preview off, threads 1 (6 ROI strips), no JSON output, UART "
             << kDefaultSerialDevice << " at 115200 8N1 for camera sources.\n"
                "--preview-scale shrinks the preview window (0.5 is much cheaper to draw on "
                "weak GPUs); --preview-fps limits how often it is redrawn (detection keeps "
                "running every frame); --benchmark runs a fixed number of frames and prints "
-               "per-stage timings. Press S in the camera preview to save raw/mask/overlay "
+               "per-stage timings. --threads N uses N detector workers and 6*N ROI strips. "
+               "--full-process selects a four-panel process view for --display/--overlay. Press S in the camera preview to save raw/mask/overlay "
                "images under build/captures/.\n";
 }
 
@@ -90,7 +92,8 @@ int parsePositiveInt(const std::string& value, const char* flag) {
     const long result = std::stol(value, &parsed);
     if (parsed != value.size() || result <= 0)
       throw std::runtime_error("not a positive integer");
-    return static_cast<int>(std::min<long>(result, 1000000L));
+    if (result > 1000000L) throw std::runtime_error("integer too large");
+    return static_cast<int>(result);
   } catch (const std::exception&) {
     throw std::runtime_error(std::string(flag) + " must be a positive integer");
   }
@@ -101,7 +104,8 @@ Options parse(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--help" || arg == "-h") { usage(); std::exit(0); }
-    else if (arg == "--display") options.display = true;    // Default; kept for old scripts.
+    else if (arg == "--display") options.display = true;
+    else if (arg == "--full-process") options.full_process = true;
     else if (arg == "--no-display") options.display = false;
     else if (arg == "--json") options.json = true;
     else if (arg == "--no-json") options.json = false;      // Default; kept for old scripts.
@@ -154,6 +158,9 @@ void printResult(const road_finder::RoadResult& r) {
             << ",\"valid\":" << (r.valid ? "true" : "false")
             << ",\"type\":\"" << road_finder::toString(r.type) << "\""
             << ",\"raw_type\":\"" << road_finder::toString(r.raw_type) << "\""
+            << ",\"left_junction_hits\":" << r.left_junction_hits
+            << ",\"right_junction_hits\":" << r.right_junction_hits
+            << ",\"occlusion_detected\":" << (r.occlusion_detected ? "true" : "false")
             << ",\"classification_confidence\":" << r.classification_confidence
             << ",\"directions\":[";
   bool first = true;
@@ -245,7 +252,7 @@ std::int64_t nowMilliseconds() {
 // One image: detect, optionally export the overlay/mask, optionally show it.
 std::unique_ptr<road_finder::Preview> makePreview(const Options& options, cv::Size size) {
   if (!options.display) return nullptr;
-  return std::make_unique<road_finder::Preview>(size, options.preview_scale, options.preview_fps);
+  return std::make_unique<road_finder::Preview>(size, options.preview_scale, options.preview_fps, options.full_process);
 }
 
 int runImage(const Options& options, road_finder::RoadDetector& detector,
@@ -277,7 +284,7 @@ int runImage(const Options& options, road_finder::RoadDetector& detector,
   if (serial) serial->send(result, frame.cols);
   if (options.json) printResult(result);
   if (!options.overlay_path.empty() &&
-      !cv::imwrite(options.overlay_path, road_finder::annotateResult(frame, result)))
+      !cv::imwrite(options.overlay_path, road_finder::annotateResult(frame, result, options.full_process)))
     throw std::runtime_error("cannot write overlay: " + options.overlay_path);
   if (!options.mask_path.empty() && !cv::imwrite(options.mask_path, result.road_mask))
     throw std::runtime_error("cannot write mask: " + options.mask_path);
@@ -285,7 +292,7 @@ int runImage(const Options& options, road_finder::RoadDetector& detector,
   return 0;
 }
 
-void saveSnapshot(const cv::Mat& frame, const road_finder::RoadResult& result) {
+void saveSnapshot(const cv::Mat& frame, const road_finder::RoadResult& result, bool full_process) {
   const std::filesystem::path directory("build/captures");
   std::filesystem::create_directories(directory);
   const std::string prefix = (directory / std::to_string(result.timestamp_ms)).string();
@@ -293,6 +300,9 @@ void saveSnapshot(const cv::Mat& frame, const road_finder::RoadResult& result) {
       !cv::imwrite(prefix + "_mask.png", result.road_mask) ||
       !cv::imwrite(prefix + "_overlay.png", road_finder::annotateResult(frame, result)))
     throw std::runtime_error("cannot write snapshot images");
+  if (full_process && !cv::imwrite(prefix + "_process.png",
+      road_finder::annotateResult(frame, result, true)))
+    throw std::runtime_error("cannot write process snapshot");
   std::cerr << "snapshot saved: " << prefix << "_{raw,mask,overlay}.png"
             << " | type " << road_finder::toString(result.type)
             << " | raw_type " << road_finder::toString(result.raw_type)
@@ -326,7 +336,7 @@ int runCamera(const Options& options, const road_finder::Config& config,
       if (!keep_running) stop_reason = preview->stopReason();
       if (preview->takeSnapshotRequest()) {
         try {
-          saveSnapshot(frame, result);
+          saveSnapshot(frame, result, options.full_process);
         } catch (const std::exception& error) {
           std::cerr << "snapshot failed: " << error.what() << '\n';
         }
@@ -360,8 +370,9 @@ int main(int argc, char** argv) {
     if (camera_source && (!options.overlay_path.empty() || !options.mask_path.empty()))
       throw std::runtime_error("--overlay and --mask are available for image sources only");
 
-    if (options.threads > 0) cv::setNumThreads(options.threads);
-    const road_finder::Config config = road_finder::loadConfig(options.config);
+    cv::setNumThreads(1);
+    road_finder::Config config = road_finder::loadConfig(options.config);
+    config.threads = options.threads;
     road_finder::RoadDetector detector(config);
     const bool use_serial = options.serial_enabled &&
                             (camera_source || options.serial_device_explicit);
@@ -373,10 +384,10 @@ int main(int argc, char** argv) {
       runtime << "runtime: segmentation " << config.segmentation_mode
               << ", confirm " << config.classification_confirm_frames
               << " frames, smooth " << config.geometry_smoothing_alpha
-              << ", threads " << cv::getNumThreads();
+              << ", threads " << config.threads << ", ROI blocks " << config.threads * 6;
       if (options.display)
-        runtime << ", preview " << cvRound(config.input_width * options.preview_scale) << 'x'
-                << cvRound(config.input_height * options.preview_scale);
+        runtime << ", preview " << cvRound(config.input_width * options.preview_scale * (options.full_process ? 2 : 1)) << 'x'
+                << cvRound(config.input_height * options.preview_scale * (options.full_process ? 2 : 1));
       else
         runtime << ", preview off";
       runtime << ", UART " << (serial ? options.serial_device : "off");

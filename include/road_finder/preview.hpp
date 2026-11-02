@@ -60,9 +60,10 @@ class PreviewWindowState {
   int unusable_readings_ = 0;
 };
 
-// Draws the boundaries, the centerline and the road-condition panel, without the
-// frame-rate line. Used for the single-frame preview and for --overlay exports.
-cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result);
+// Draws measured centers, fitted geometry, six junction boxes and status.
+// full_process selects a four-panel process montage; no frame-rate line.
+cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result,
+                       bool full_process = false);
 
 // Owns the preview window: creation, drawing, event loop and close detection.
 class Preview {
@@ -73,7 +74,8 @@ class Preview {
   // preview is much cheaper. refresh_hz > 0 limits how often the window is
   // redrawn while detection keeps running on every frame (0 = every frame).
   // Throws when the window cannot be created (no display, no GUI backend).
-  Preview(cv::Size image_size, double scale = 1.0, double refresh_hz = 0.0);
+  Preview(cv::Size image_size, double scale = 1.0, double refresh_hz = 0.0,
+          bool full_process = false);
 
   // Draws one frame and pumps the GUI event loop. wait_ms is passed to
   // cv::waitKey: 1 while streaming, 0 to block on a single image. Returns false
@@ -96,6 +98,7 @@ class Preview {
   bool unusable_visibility_reported_ = false;
   std::string stop_reason_;
   cv::Mat canvas_;
+  bool full_process_ = false;
   double scale_ = 1.0;
   double refresh_hz_ = 0.0;
   std::chrono::steady_clock::time_point last_draw_{};

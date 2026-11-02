@@ -5,6 +5,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,11 +24,11 @@ enum class RoadType {
 
 enum Direction : unsigned { LEFT = 1, STRAIGHT = 2, RIGHT = 4 };
 
-// OpenCV's 8-bit Lab representation: L, a and b are all in [0, 255].
-struct LabRange {
-  int l_min = 133, l_max = 171;
-  int a_min = 124, a_max = 148;
-  int b_min = 123, b_max = 138;
+// OpenCV 8-bit HSV: H in [0,179], S/V in [0,255]; H_min > H_max wraps at zero.
+struct HsvRange {
+  int h_min = 80, h_max = 135;
+  int s_min = 10, s_max = 150;
+  int v_min = 40, v_max = 230;
 };
 
 struct Config {
@@ -39,26 +41,33 @@ struct Config {
   std::array<cv::Point2f, 4> perspective_dst{};
   bool use_perspective = false;
 
-  LabRange road_lab{};
-  // "lab" preserves calibrated color segmentation; "adaptive_dark" learns
+  HsvRange road_hsv{};
+  std::optional<HsvRange> side_road_hsv;  // Unset: inherit road_hsv on both sides.
+  int side_left_end_reference = 36;
+  int side_right_begin_reference = 92;
+  float marker_min_coverage = 0.35f;
+  int white_s_max = 45;
+  int white_v_min = 170;
+  float occlusion_max_gap_fraction = 0.25f;
+  float geometry_min_span_fraction = 0.15f;
+  // "hsv" preserves calibrated color segmentation; "adaptive_dark" learns
   // road/floor chroma when distinct, with row/frame brightness as fallback.
-  std::string segmentation_mode = "lab";
+  std::string segmentation_mode = "hsv";
   int road_contrast_min = 18;
   float min_road_width_fraction = 0.06f;
   float max_road_width_fraction = 0.85f;
   int classification_confirm_frames = 1;
   int classification_hold_frames = 0;
   float geometry_smoothing_alpha = 1.0f;
-  // The sample's six scan strips and event regions are calibrated in 128x90
-  // coordinates, then scaled independently to the processing image.
-  std::array<cv::Rect, 6> scan_bands{{
-      {0, 42, 128, 7}, {0, 49, 128, 7}, {0, 56, 128, 7},
-      {0, 63, 128, 7}, {0, 70, 128, 7}, {0, 77, 128, 7}}};
+  int threads = 1;  // Worker count; the ROI has threads * 6 horizontal strips.
+  // Event regions use independently scaled 128x90 reference coordinates.
   cv::Rect indicator_roi{50, 34, 28, 30};
-  cv::Rect left_marker_roi{10, 50, 10, 10};
-  cv::Rect right_marker_roi{108, 50, 10, 10};
+  std::array<cv::Rect, 3> left_marker_rois{{{10, 38, 10, 10}, {24, 28, 10, 10},
+                                           {24, 48, 10, 10}}};
+  std::array<cv::Rect, 3> right_marker_rois{{{108, 38, 10, 10}, {94, 28, 10, 10},
+                                            {94, 48, 10, 10}}};
   cv::Rect stop_roi{50, 50, 28, 7};
-  LabRange stop_lab{51, 135, 149, 193, 83, 119};
+  HsvRange stop_hsv{170, 10, 100, 255, 80, 255};
   bool stop_detection_enabled = false;
   int min_blob_area_reference = 10;
   int indicator_min_area_reference = 53;
@@ -74,6 +83,14 @@ struct Config {
 Config loadConfig(const std::string& path);
 void validateConfig(const Config& config);
 
+struct BlockObservation {
+  cv::Rect processed_region;
+  std::vector<cv::Point2f> polygon;  // Original input-image coordinates.
+  bool found = false;
+  float coverage = 0.0f;  // Fraction of measured road pixels in a junction box.
+  cv::Point2f midpoint{};  // Measured, before line fitting and temporal smoothing.
+};
+
 struct RoadResult {
   std::int64_t timestamp_ms = 0;
   bool valid = false;  // Measured steering geometry; independent of junction type.
@@ -83,20 +100,32 @@ struct RoadResult {
   float confidence = 0.0f;
   float classification_confidence = 0.0f;
   bool stop_detected = false;
+  int left_junction_hits = 0;
+  int right_junction_hits = 0;
+  bool occlusion_detected = false;
   float lateral_error = 0.0f;  // Positive: target center is to the vehicle's right.
   float heading_error_rad = 0.0f;  // Positive: path turns to the right.
   std::vector<cv::Point2f> left_boundary;   // Original input-image coordinates.
   std::vector<cv::Point2f> right_boundary;
   std::vector<cv::Point2f> centerline;
+  std::vector<BlockObservation> scan_blocks;
+  std::array<BlockObservation, 6> junction_blocks{};  // L1..L3, R1..R3.
+  cv::Mat white_mask;  // Color candidates; not all white pixels are occlusions.
+  cv::Mat occlusion_mask;  // White inside a geometrically supported road corridor.
+  cv::Mat bridge_mask;  // Association only; never measured or counted in votes.
+  std::array<int, 2> hsv_region_edges{};  // Processing x coordinates.
   cv::Mat road_mask;  // Optional debug image, at process resolution.
   std::vector<cv::Point2f> roi_polygon;
 };
 
 const char* toString(RoadType type);
 
+class WorkerPool;
+
 class RoadDetector {
  public:
   explicit RoadDetector(Config config);
+  ~RoadDetector();
   // Temporal filtering is opt-in for video; still images remain independent.
   RoadResult process(const cv::Mat& bgr, std::int64_t timestamp_ms, bool temporal = false);
   // Public for deterministic tests and camera-specific segmenters. Mask must
@@ -113,10 +142,10 @@ class RoadDetector {
   cv::Mat valid_view_mask_;
   cv::Rect roi_processed_;
   std::vector<cv::Point2f> roi_polygon_;
-  std::array<cv::Rect, 6> scan_bands_processed_{};
+  std::vector<cv::Rect> scan_bands_processed_;
+  std::unique_ptr<WorkerPool> workers_;
   cv::Rect indicator_roi_processed_;
-  cv::Rect left_marker_roi_processed_;
-  cv::Rect right_marker_roi_processed_;
+  std::array<cv::Rect, 6> marker_rois_processed_{};
   cv::Rect stop_roi_processed_;
   RoadType stable_type_ = RoadType::UNKNOWN;
   RoadType pending_type_ = RoadType::UNKNOWN;
@@ -127,6 +156,7 @@ class RoadDetector {
   std::int64_t previous_timestamp_ms_ = 0;
   RoadResult previous_geometry_;
 
+  std::vector<cv::Point2f> sourcePolygon(const cv::Rect& rect) const;
   void prepareView(const cv::Mat& bgr, cv::Mat& processed, cv::Mat& view) const;
   cv::Mat segment(const cv::Mat& view) const;
   RoadResult analyzeMask(const cv::Mat& mask, std::int64_t timestamp_ms,
