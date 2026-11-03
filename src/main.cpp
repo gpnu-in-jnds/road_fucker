@@ -158,24 +158,10 @@ void printResult(const road_finder::RoadResult& r) {
             << ",\"valid\":" << (r.valid ? "true" : "false")
             << ",\"type\":\"" << road_finder::toString(r.type) << "\""
             << ",\"raw_type\":\"" << road_finder::toString(r.raw_type) << "\""
-            << ",\"left_junction_hits\":" << r.left_junction_hits
-            << ",\"right_junction_hits\":" << r.right_junction_hits
+            << ",\"road_end_detected\":" << (r.road_end_detected ? "true" : "false")
+            << ",\"road_end_coverage\":" << r.road_end_region.coverage
             << ",\"occlusion_detected\":" << (r.occlusion_detected ? "true" : "false")
             << ",\"classification_confidence\":" << r.classification_confidence
-            << ",\"directions\":[";
-  bool first = true;
-  const std::array<std::pair<unsigned, const char*>, 3> directions{{
-      {road_finder::LEFT, "left"},
-      {road_finder::STRAIGHT, "straight"},
-      {road_finder::RIGHT, "right"}}};
-  for (const auto& item : directions) {
-    if (r.available_directions & item.first) {
-      if (!first) std::cout << ',';
-      std::cout << '"' << item.second << '"';
-      first = false;
-    }
-  }
-  std::cout << "]"
             << ",\"confidence\":" << r.confidence
             << ",\"lateral_error\":" << r.lateral_error
             << ",\"heading_error_rad\":" << r.heading_error_rad
@@ -381,9 +367,8 @@ int main(int argc, char** argv) {
     logGeometry(config, detector);
     {
       std::ostringstream runtime;
-      runtime << "runtime: segmentation " << config.segmentation_mode
-              << ", confirm " << config.classification_confirm_frames
-              << " frames, smooth " << config.geometry_smoothing_alpha
+      runtime << "runtime: segmentation " << "hsv"
+              << ", RoadEnd >=2 measured points and >=80% non-mask (current frame)"
               << ", threads " << config.threads << ", ROI blocks " << config.threads * 6;
       if (options.display)
         runtime << ", preview " << cvRound(config.input_width * options.preview_scale * (options.full_process ? 2 : 1)) << 'x'

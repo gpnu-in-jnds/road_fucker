@@ -9,7 +9,7 @@ struct OcclusionEvidence {
 };
 
 // White regions are associated only with measured road edges. Bridges carry
-// component connectivity, never geometric measurements or junction votes.
+// component connectivity, never geometric measurements.
 OcclusionEvidence findOcclusions(const cv::Mat& road, const cv::Mat& white,
                                  cv::Rect roi, const Config& config);
 }  // namespace road_finder

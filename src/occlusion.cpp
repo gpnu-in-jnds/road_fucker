@@ -25,8 +25,8 @@ OcclusionEvidence findOcclusions(const cv::Mat& road, const cv::Mat& white,
   OcclusionEvidence result{cv::Mat::zeros(road.size(), CV_8UC1),
                            cv::Mat::zeros(road.size(), CV_8UC1)};
   if (white.empty() || cv::countNonZero(white) == 0) return result;
-  // Junction topology searches above the steering ROI too. Search that same
-  // vertical extent while keeping the gap budget relative to the steering ROI.
+  // Search above the steering ROI too, so distant measured road can explain
+  // a white gap. Keep the gap budget relative to the steering ROI.
   const cv::Rect search(roi.x, 0, roi.width, roi.y + roi.height);
   std::vector<Span> profile(road.rows);
   for (int y = search.y; y < roi.y + roi.height; ++y) {

@@ -21,16 +21,11 @@ constexpr double kRadiansToDegrees = 180.0 / CV_PI;
 
 std::uint8_t wireType(const RoadResult& result) {
   switch (result.type) {
-    case RoadType::STRAIGHT: return result.valid ? 0x00 : 0x04;
-    case RoadType::LEFT_TURN: return 0x01;
-    case RoadType::RIGHT_TURN: return 0x02;
-    case RoadType::T_JUNCTION: return 0x03;
-    case RoadType::UNKNOWN:
-    case RoadType::LEFT_BRANCH:
-    case RoadType::RIGHT_BRANCH:
-      return 0x04;
+    case RoadType::Straight: return result.valid ? 0x00 : 0x02;
+    case RoadType::RoadEnd: return 0x01;
+    case RoadType::Unknown: return 0x02;
   }
-  return 0x04;
+  return 0x02;
 }
 
 std::int16_t boundedInt16(long value) {
@@ -55,13 +50,13 @@ RoadPacket encodeRoadPacket(const RoadResult& result, int input_width) {
   packet.bytes[0] = 0xFF;
   packet.bytes[1] = 0x7A;
   packet.bytes[2] = wireType(result);
-  if (packet.bytes[2] == 0x04) {
+  if (packet.bytes[2] == 0x02) {
     packet.size = 3;
     return packet;
   }
 
   packet.size = packet.bytes.size();
-  // Junction topology remains useful when a close crossbar hides the stem.
+  // RoadEnd remains useful even when too little road is left for line fitting.
   // The fixed seven-byte contract has no geometry-valid flag: use zero
   // placeholders and never reuse measurements from an invalid result.
   if (!result.valid) return packet;

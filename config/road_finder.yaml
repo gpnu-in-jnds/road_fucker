@@ -4,48 +4,29 @@ input_width: 1280
 input_height: 720
 process_width: 640
 
-# Input-image pixels. The complete ROI is split into --threads * 6 strips.
+# Original input-image pixels. --threads N splits the ROI into N * 6 strips.
 roi: [0, 360, 1280, 360]
-segmentation_mode: hsv
-# OpenCV HSV [Hmin,Hmax,Smin,Smax,Vmin,Vmax]. H: 0..179, S/V: 0..255.
-# A reversed H interval wraps through zero. Calibrate for the actual camera.
-road_hsv: [80, 135, 10, 150, 40, 230]
-# Both dark sides share this optional range. Omit to inherit road_hsv.
-# Initial value only: calibrate road AND floor pixels under the actual light.
-side_road_hsv: [80, 135, 10, 150, 40, 230]
-side_left_end_reference: 36
-side_right_begin_reference: 92
-marker_min_coverage: 0.35
+# One fixed range for the entire view, calibrated under the final auxiliary light.
+# OpenCV HSV [Hmin,Hmax,Smin,Smax,Vmin,Vmax], inclusive endpoints.
+# Each reversed pair means [first,channel_max] OR [0,last]; equal means one value.
+# Channel maxima: H=179, S/V=255. H, S and V must all match.
+# H in [70,179] OR [0,10]: retain low-H road patches, exclude H25..45 background.
+# Both hue intervals share S/V bounds; keep these calibrated for the actual camera.
+road_hsv: [70, 10, 10, 150, 40, 230]
+# Used only by white-occlusion diagnostics; they do not gate steering or RoadEnd.
+min_road_width_fraction: 0.06
+max_road_width_fraction: 0.85
+morphology_pixels: 3
+
+# Trigger window in ORIGINAL input-image pixels; may lie outside the tracking roi.
+# Initial values only: calibrate against the camera angle and stopping distance.
+# RoadEnd: >=2 measured strip centroids and >=80% non-mask in this window, immediately.
+road_end_roi: [400, 540, 480, 120]
+
+# White candidates are NOT automatically occlusions or road ends.
 white_s_max: 45
 white_v_min: 170
 occlusion_max_gap_fraction: 0.25
-geometry_min_span_fraction: 0.15
-road_contrast_min: 18
-min_road_width_fraction: 0.06
-max_road_width_fraction: 0.85
-classification_confirm_frames: 1
-classification_hold_frames: 2
-geometry_smoothing_alpha: 0.35
-morphology_pixels: 3
-min_blob_area_reference: 10
-
-# Event rectangles in 128x90 reference pixels: outer, inner-upper, inner-lower.
-indicator_roi: [50, 34, 28, 30]
-indicator_min_area_reference: 53
-left_marker_rois:
-  - [10, 38, 10, 10]
-  - [24, 28, 10, 10]
-  - [24, 48, 10, 10]
-right_marker_rois:
-  - [108, 38, 10, 10]
-  - [94, 28, 10, 10]
-  - [94, 48, 10, 10]
-
-# Initial red range only; no stop-zone camera fixture is available for calibration.
-stop_detection_enabled: 0
-stop_roi: [50, 50, 28, 7]
-stop_hsv: [170, 10, 100, 255, 80, 255]
-stop_min_area_reference: 53
 
 # Optional perspective transform, original-input pixels ordered TL, TR, BR, BL.
 # perspective_src: [[430, 120], [930, 120], [1220, 700], [60, 700]]

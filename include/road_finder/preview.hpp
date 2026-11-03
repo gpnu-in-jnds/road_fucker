@@ -60,7 +60,7 @@ class PreviewWindowState {
   int unusable_readings_ = 0;
 };
 
-// Draws measured centers, fitted geometry, six junction boxes and status.
+// Draws a translucent red road mask, measured/fitted centers, end box and status.
 // full_process selects a four-panel process montage; no frame-rate line.
 cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result,
                        bool full_process = false);
@@ -91,7 +91,6 @@ class Preview {
   }
 
  private:
-  void frameCompleted();
   bool refreshDue(bool forced) const;
 
   PreviewWindowState state_;
@@ -104,9 +103,7 @@ class Preview {
   std::chrono::steady_clock::time_point last_draw_{};
   bool drawn_once_ = false;
   bool snapshot_requested_ = false;
-  std::chrono::steady_clock::time_point fps_window_start_ = std::chrono::steady_clock::now();
-  int fps_frames_ = 0;
-  double fps_ = -1.0;
+
 };
 
 }  // namespace road_finder

@@ -1,213 +1,150 @@
-#include "road_finder/road_detector.hpp"
+#include "test_support.hpp"
 #include "road_finder/preview.hpp"
-#include "road_finder/uart_sender.hpp"
-#include <opencv2/imgproc.hpp>
+
 #include <opencv2/imgcodecs.hpp>
+
 #include <iostream>
-#include <stdexcept>
 
 namespace {
-void require(bool condition, const char* message) {
-  if (!condition) throw std::runtime_error(message);
-}
+using namespace road_finder;
+using namespace road_finder::test;
 
-road_finder::Config configFor(int threads) {
-  road_finder::Config config;
-  config.threads = threads;
-  config.roi = {0, 360, 1280, 360};
-  return config;
-}
-
-cv::Rect scaled(const cv::Rect& reference) {
-  return {reference.x * 5, reference.y * 4, reference.width * 5, reference.height * 4};
-}
-
-cv::Mat junction() {
-  cv::Mat mask = cv::Mat::zeros(360, 640, CV_8UC1);
-  cv::rectangle(mask, {0, 60}, {639, 240}, cv::Scalar(255), -1);
-  cv::rectangle(mask, {280, 240}, {360, 359}, cv::Scalar(255), -1);
-  return mask;
-}
-
-void expectVotes() {
-  for (int threads : {1, 2, 4}) {
-    const auto config = configFor(threads);
-    road_finder::RoadDetector detector(config);
-    for (int left = 0; left <= 3; ++left) {
-      for (int right = 0; right <= 3; ++right) {
-        cv::Mat mask = junction();
-        for (int i = left; i < 3; ++i)
-          mask(scaled(config.left_marker_rois[i])).setTo(0);
-        for (int i = right; i < 3; ++i)
-          mask(scaled(config.right_marker_rois[i])).setTo(0);
-        const auto result = detector.processMask(mask, 1);
-        require(result.left_junction_hits == left && result.right_junction_hits == right,
-                "each side must count exactly its observed boxes");
-        require(result.type == (left >= 2 && right >= 2 ? road_finder::RoadType::T_JUNCTION
-                                                       : road_finder::RoadType::UNKNOWN),
-                "topology must not bypass two votes or downgrade a partial T to a turn");
-      }
-    }
-    for (bool left_side : {false, true}) {
-      cv::Mat turn = junction();
-      turn(cv::Rect(left_side ? 361 : 0, 0, left_side ? 279 : 280, 240)).setTo(0);
-      const auto expected = left_side ? road_finder::RoadType::LEFT_TURN
-                                     : road_finder::RoadType::RIGHT_TURN;
-      const auto single = detector.processMask(turn, 2);
-      if (single.type != expected)
-        std::cerr << "single exit threads=" << threads << " left=" << left_side
-                  << " type=" << road_finder::toString(single.type) << " votes="
-                  << single.left_junction_hits << "/" << single.right_junction_hits << '\n';
-      require(single.type == expected, "supported single exit should remain a turn");
-      const auto& boxes = left_side ? config.left_marker_rois : config.right_marker_rois;
-      turn(scaled(boxes[1])).setTo(0);
-      turn(scaled(boxes[2])).setTo(0);
-      require(detector.processMask(turn, 3).type == road_finder::RoadType::UNKNOWN,
-              "single turn must also satisfy two votes");
-    }
-  }
-  auto config = configFor(2);
-  config.classification_hold_frames = 5;
-  road_finder::RoadDetector video(config);
-  require(video.processMask(junction(), 100, true).type == road_finder::RoadType::T_JUNCTION,
-          "video must first accept the measured T");
-  cv::Mat lost_votes = junction();
-  lost_votes(scaled(config.left_marker_rois[1])).setTo(0);
-  lost_votes(scaled(config.left_marker_rois[2])).setTo(0);
-  const auto rejected = video.processMask(lost_votes, 167, true);
-  require(rejected.type == road_finder::RoadType::UNKNOWN && rejected.available_directions == 0,
-          "temporal hold must not bypass current votes");
-  require(road_finder::encodeRoadPacket(rejected, 1280).size == 3,
-          "rejected junction must send the existing UNKNOWN packet");
-}
-
-cv::Mat coloredRoad(int top, int bottom, int value = 230) {
-  cv::Mat hsv(720, 1280, CV_8UC3, cv::Scalar(30, 120, 130));
-  cv::rectangle(hsv, {500, 0}, {780, 719}, cv::Scalar(110, 100, 180), -1);
-  if (bottom > top)
-    hsv(cv::Rect(500, top, 281, bottom - top)).setTo(cv::Scalar(0, 0, value));
+cv::Scalar hsvColor(int hue, int saturation = 100, int value = 180) {
+  const cv::Mat hsv(1, 1, CV_8UC3, cv::Scalar(hue, saturation, value));
   cv::Mat bgr;
   cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
-  return bgr;
+  const auto pixel = bgr.at<cv::Vec3b>(0, 0);
+  return cv::Scalar(pixel[0], pixel[1], pixel[2]);
 }
 
-void expectSideThresholds() {
-  auto config = configFor(2);
-  config.road_hsv = {90, 125, 80, 170, 120, 230};
-  cv::Mat hsv(720, 1280, CV_8UC3, cv::Scalar(30, 80, 150));
-  cv::Mat mask;
-  cv::resize(junction(), mask, hsv.size(), 0, 0, cv::INTER_NEAREST);
-  hsv.setTo(cv::Scalar(110, 120, 190), mask);
-  for (const cv::Rect& region : {cv::Rect(0, 0, 360, 720), cv::Rect(920, 0, 360, 720)})
-    hsv(region).setTo(cv::Scalar(110, 120, 65), mask(region));
-  cv::Mat frame;
-  cv::cvtColor(hsv, frame, cv::COLOR_HSV2BGR);
-  road_finder::RoadDetector central_only(config);
-  const auto missed = central_only.process(frame, 1);
-  require(missed.left_junction_hits == 0 && missed.right_junction_hits == 0,
-          "central threshold must demonstrate dark-side failure");
-  config.side_road_hsv = road_finder::HsvRange{90, 125, 80, 170, 30, 100};
-  road_finder::RoadDetector partitioned(config);
-  for (bool mirror : {false, true}) {
-    cv::Mat input;
-    if (mirror) cv::flip(frame, input, 1); else input = frame;
-    const auto result = partitioned.process(input, 2);
-    require(result.type == road_finder::RoadType::T_JUNCTION &&
-                result.left_junction_hits == 3 && result.right_junction_hits == 3,
-            "one shared side threshold must recover both dark sides");
-    require(result.road_mask.at<unsigned char>(300, 320) != 0,
-            "side filtering must not remove the bright central stem");
+cv::Mat mixedHueRoad(int top, int floor_hue, int width = 81) {
+  cv::Mat frame = image(road(top, 320, width), hsvColor(floor_hue), hsvColor(0));
+  const cv::Scalar high_hue = hsvColor(100);
+  // Large real road patches must survive segmentation, not rely on morphology.
+  for (int y = top; y < frame.rows; ++y) {
+    const int left = (y / 60) % 2 == 0 ? 320 - width / 2 : 321;
+    frame(cv::Rect(left, y, width / 2, 1)).setTo(high_hue);
   }
+  return frame;
 }
 
-void expectOcclusion() {
-  for (int threads : {1, 2, 4}) {
-    auto config = configFor(threads);
-    road_finder::RoadDetector detector(config);
-    const auto repaired = detector.process(coloredRoad(480, 540), 1);
-    require(repaired.occlusion_detected && cv::countNonZero(repaired.bridge_mask) > 0,
-            "bounded white gap must be associated using both measured road edges");
-    require(repaired.valid && repaired.type == road_finder::RoadType::STRAIGHT,
-            "bounded speed bump should retain measured straight geometry");
-    require(cv::countNonZero(repaired.bridge_mask & repaired.road_mask) == 0,
-            "bridge pixels must not enter the measured road mask");
-    for (const auto& block : repaired.scan_blocks)
-      if (block.found)
-        require(repaired.road_mask.at<unsigned char>(cvRound(block.midpoint.y * 0.5f),
-                    cvRound(block.midpoint.x * 0.5f)) != 0 &&
-                repaired.bridge_mask.at<unsigned char>(cvRound(block.midpoint.y * 0.5f),
-                    cvRound(block.midpoint.x * 0.5f)) == 0,
-                "white bridge cannot fabricate measured centers");
-    const auto unbounded = detector.process(coloredRoad(380, 680), 2);
-    require(unbounded.occlusion_detected && cv::countNonZero(unbounded.bridge_mask) == 0 &&
-                !unbounded.valid && unbounded.centerline.empty(),
-            "large white gap with little road visible must not fabricate geometry");
-    require(unbounded.type == road_finder::RoadType::UNKNOWN,
-            "unobservable white region must not be a turn or inherit straight geometry");
-    const auto shadow = detector.process(coloredRoad(480, 540, 80), 3);
-    require(!shadow.occlusion_detected && cv::countNonZero(shadow.bridge_mask) == 0,
-            "a dark disconnected gap must not be treated as a white speed bump");
-    const auto floor = detector.process(cv::Mat(720, 1280, CV_8UC3, cv::Scalar::all(230)), 4);
-    require(!floor.valid && !floor.occlusion_detected && cv::countNonZero(floor.bridge_mask) == 0,
-            "white background alone supplies no road corridor");
+void crossZeroRoad() {
+  RoadDetector detector(config());
+  for (int hue : {0, 10, 70, 100, 179}) {
+    const auto result = detector.process(image(road(), hsvColor(35), hsvColor(hue)), 100);
+    require(result.valid && result.type == RoadType::Straight,
+            "default range must track hue " + std::to_string(hue));
+    require(result.road_mask.at<unsigned char>(250, 320) != 0,
+            "both inclusive hue intervals must retain road pixels");
   }
-  auto config = configFor(4);
-  road_finder::RoadDetector detector(config);
-  const auto bottom = detector.process(coloredRoad(660, 720), 1);
-  require(bottom.occlusion_detected && bottom.valid && !bottom.centerline.empty(),
-          "visible road may be reacquired across a limited white bottom region");
-  float last_measured_y = 0;
-  for (const auto& block : bottom.scan_blocks)
-    if (block.found) last_measured_y = std::max(last_measured_y, block.midpoint.y);
-  require(std::abs(bottom.centerline.back().y - last_measured_y) < 0.01f,
-          "reacquisition must end at a measured row rather than extrapolate into white");
-  const auto too_far = detector.process(coloredRoad(480, 720), 2);
-  require(too_far.occlusion_detected && !too_far.valid,
-          "road far beyond the vehicle cannot substitute for a hidden near road");
-  // Two visually separated roads must not be joined merely because their
-  // endpoints overlap across white; their measured directions disagree.
-  cv::Mat opposed_hsv(720, 1280, CV_8UC3, cv::Scalar(30, 120, 130));
-  for (int y = 0; y < 720; ++y) {
-    const int center = y < 480 ? 640 + (y - 480) / 2 : 640 - (y - 540) / 2;
-    if (y >= 480 && y < 540) continue;
-    opposed_hsv.row(y).colRange(center - 140, center + 141).setTo(cv::Scalar(110, 100, 180));
+  for (int hue : {11, 25, 35, 45, 69}) {
+    const auto result = detector.process(image(road(), hsvColor(35), hsvColor(hue)), 100);
+    require(!result.valid && result.type == RoadType::Unknown &&
+            cv::countNonZero(result.road_mask) == 0,
+            "default range must reject hue " + std::to_string(hue));
   }
-  opposed_hsv(cv::Rect(500, 480, 281, 60)).setTo(cv::Scalar(0, 0, 230));
-  cv::Mat opposed;
-  cv::cvtColor(opposed_hsv, opposed, cv::COLOR_HSV2BGR);
-  require(cv::countNonZero(detector.process(opposed, 3).bridge_mask) == 0,
-          "white must not connect roads with conflicting measured headings");
+  for (const auto& color : {hsvColor(0, 0), hsvColor(100, 200),
+                            hsvColor(0, 100, 30), hsvColor(100, 100, 250)}) {
+    const auto result = detector.process(image(road(), hsvColor(35), color), 100);
+    require(!result.valid && cv::countNonZero(result.road_mask) == 0,
+            "hue-wrap must still enforce shared saturation and value bounds");
+  }
+  const cv::Mat straight = mixedHueRoad(0, 35);
+  const auto fitted = detector.process(straight, 100);
+  require(fitted.valid && fitted.type == RoadType::Straight,
+          "large low/high-hue road patches must produce a continuous centerline");
+  for (const auto& block : fitted.scan_blocks)
+    require(block.found && std::abs(block.midpoint.x - 320) < 1.0f,
+            "both hues must contribute to the measured road width and center");
+  for (int hue : {25, 35, 45}) {
+    const cv::Mat end = mixedHueRoad(300, hue);
+    RoadResult result;
+    for (int frame = 1; frame <= 3; ++frame) {
+      result = detector.process(end, frame * 30, true);
+      require(result.road_end_detected && result.raw_type == RoadType::RoadEnd,
+              "excluded background hue must provide non-mask evidence in the end box");
+      require(result.type == RoadType::RoadEnd,
+              "mixed-hue end must publish on the first matching frame");
+    }
+    require(cv::countNonZero(result.road_mask(cv::Rect(280, 200, 81, 50))) == 0,
+            "H25..45 beyond the cap must stay outside the road mask");
+    require(result.road_mask.at<unsigned char>(310, 290) &&
+            result.road_mask.at<unsigned char>(310, 350),
+            "both hue groups must remain measured near the cap");
+    if (hue == 35) cv::imwrite("hue_wrap_end_overlay.png", annotateResult(end, result));
+  }
+  cv::imwrite("hue_wrap_straight_overlay.png", annotateResult(straight, fitted));
+}
 
-  // A white gap above the steering ROI must not become a closed forward exit.
-  cv::Mat flare_hsv(720, 1280, CV_8UC3, cv::Scalar(30, 120, 130));
-  for (int y = 0; y < 720; ++y) {
-    const int half_width = 140 + (720 - y) / 2;
-    flare_hsv.row(y).colRange(640 - half_width, 641 + half_width).setTo(cv::Scalar(110, 100, 180));
+void fixedHsv() {
+  RoadDetector detector(config());
+  for (const cv::Scalar& color : {cv::Scalar(150, 100, 80), cv::Scalar(110, 75, 60),
+                                  cv::Scalar(190, 130, 105)}) {
+    const auto measured = detector.process(image(road(), {160, 160, 160}, color), 100);
+    require(measured.valid && measured.type == RoadType::Straight,
+            "fixed HSV must track calibrated road colors under bounded light variation");
   }
-  flare_hsv.rowRange(100, 160).setTo(cv::Scalar(0, 0, 230));
-  cv::Mat flare;
-  cv::cvtColor(flare_hsv, flare, cv::COLOR_HSV2BGR);
-  const auto far_gap = detector.process(flare, 4);
-  require(far_gap.occlusion_detected && far_gap.type != road_finder::RoadType::T_JUNCTION,
-          "white outside the steering ROI must not fabricate a closed junction");
-  const auto large_white = detector.process(coloredRoad(380, 680), 5);
-  require(cv::imwrite("field_unobservable_process.png",
-      road_finder::annotateResult(coloredRoad(380, 680), large_white, true)),
-      "unobservable diagnostic export must succeed");
-  require(cv::imwrite("field_occlusion_process.png",
-              road_finder::annotateResult(coloredRoad(480, 540),
-                  detector.process(coloredRoad(480, 540), 6), true)),
-          "occlusion diagnostic export must succeed");
+  require(detector.process(image(road(300)), 100).type == RoadType::RoadEnd,
+          "natural end must work through the BGR/HSV path");
+  require(detector.process(image(road(300), {220, 220, 220}), 100).type == RoadType::RoadEnd,
+          "white floor matching both sides is not automatically an occlusion");
+  cv::Mat glare = image(road(300));
+  glare(cv::Rect(275, 240, 91, 40)).setTo(cv::Scalar(255, 255, 255));
+  require(detector.process(glare, 100).road_end_detected,
+          "background color and glare must not add a veto to the two area conditions");
+  cv::Mat dim = image(road(), {160, 160, 160}, {20, 13, 10});
+  const auto lost = detector.process(dim, 100);
+  require(!lost.valid && lost.type == RoadType::Unknown && !lost.road_end_detected,
+          "out-of-calibration light fails as Unknown without adaptive compensation");
+  auto wrapped = config();
+  wrapped.road_hsv = {170, 10, 100, 255, 80, 255};
+  require(RoadDetector(wrapped).process(image(road(), {160,160,160}, {0,0,180}), 100).valid,
+          "fixed HSV must retain hue-wrap support");
 }
+
+void occlusion() {
+  RoadDetector detector(config());
+  cv::Mat frame = image(road());
+  frame(cv::Rect(280, 250, 81, 20)).setTo(cv::Scalar(240, 240, 240));
+  const auto bridged = detector.process(frame, 100);
+  require(bridged.occlusion_detected && !bridged.road_end_detected,
+          "white gap with road beyond it is an occlusion");
+  require(bridged.valid, "sufficiently filled narrow masks still contribute geometry");
+  require(cv::countNonZero(bridged.bridge_mask) > 0, "a short supported gap can associate road");
+  for (const auto& block : bridged.scan_blocks) {
+    if (!block.found) continue;
+    const cv::Point point(cvRound(block.midpoint.x), cvRound(block.midpoint.y));
+    require(bridged.road_mask.at<unsigned char>(point) && !bridged.bridge_mask.at<unsigned char>(point),
+            "center points must be real measurements, never white bridge pixels");
+  }
+  cv::Mat large = image(road());
+  large(cv::Rect(280, 210, 81, 100)).setTo(cv::Scalar(240,240,240));
+  const auto blocked = detector.process(large, 100);
+  require(blocked.road_end_detected,
+          "visible continuation and occlusion diagnostics do not veto the requested area rule");
+  cv::Mat bottom = image(road());
+  bottom(cv::Rect(280, 300, 81, 60)).setTo(cv::Scalar(240,240,240));
+  const auto lost = detector.process(bottom, 100);
+  require(lost.type == RoadType::Straight && lost.valid && !lost.centerline.empty() &&
+          !lost.road_end_detected,
+          "remaining filled narrow masks provide geometry without becoming RoadEnd");
+  cv::Mat side = image(road());
+  side(cv::Rect(0, 200, 100, 100)).setTo(cv::Scalar(255,255,255));
+  const auto outside = detector.process(side, 100);
+  require(outside.valid && !outside.occlusion_detected && !outside.road_end_detected,
+          "white floor outside the corridor must not be treated as an obstruction");
 }
+}  // namespace
 
 int main() {
   try {
-    expectVotes(); expectSideThresholds(); expectOcclusion();
-    std::cout << "field condition tests passed\n";
+    fixedHsv();
+    crossZeroRoad();
+    occlusion();
+    std::cout << "field conditions tests passed\n";
     return 0;
   } catch (const std::exception& error) {
-    std::cerr << "field condition tests failed: " << error.what() << '\n';
+    std::cerr << "field conditions tests failed: " << error.what() << '\n';
     return 1;
   }
 }

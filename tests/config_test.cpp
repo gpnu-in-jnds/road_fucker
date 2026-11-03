@@ -1,205 +1,133 @@
-#include "road_finder/road_detector.hpp"
+#include "test_support.hpp"
 
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <stdexcept>
-#include <string>
 
 namespace {
-
-void require(bool condition, const std::string& message) {
-  if (!condition) throw std::runtime_error(message);
-}
+using namespace road_finder;
+using road_finder::test::require;
 
 template <typename Fn>
-void requireThrows(Fn&& fn, const std::string& needle, const std::string& label) {
-  try {
-    fn();
-  } catch (const std::exception& error) {
-    const std::string what = error.what();
-    require(what.find(needle) != std::string::npos,
-            label + ": expected message containing \"" + needle + "\", got: " + what);
+void rejected(Fn&& fn, const std::string& message) {
+  try { fn(); }
+  catch (const std::exception& error) {
+    require(std::string(error.what()).find(message) != std::string::npos,
+            "expected " + message + ", got " + error.what());
     return;
   }
-  require(false, label + ": expected an exception");
+  throw std::runtime_error("expected rejection containing " + message);
 }
 
-std::string writeConfig(const std::string& name, const std::string& body) {
-  std::ofstream out(name);
-  out << "%YAML:1.0\n---\n" << body;
-  return name;
+void loadText(const std::string& body, const std::string& error) {
+  const std::string path = "config_test_invalid.yaml";
+  { std::ofstream file(path); file << "%YAML:1.0\n---\n" << body; }
+  rejected([&] { loadConfig(path); }, error);
+  std::remove(path.c_str());
 }
-
-void expectDefaultsAndValidation() {
-  road_finder::Config config;
-  require(config.processHeight() == 360, "default process size should be 640x360");
-  require(config.threads == 1, "one worker should be configured");
-  require(!config.stop_detection_enabled, "stop recognition should default off");
-  road_finder::validateConfig(config);
-
-  road_finder::Config hd;
-  hd.input_width = 1920;
-  hd.input_height = 1080;
-  hd.roi = cv::Rect(40, 130, 1840, 918);
-  require(hd.processHeight() == 360, "1080p input should retain the aspect ratio");
-  road_finder::validateConfig(hd);
-
-  road_finder::Config outside;
-  outside.roi = cv::Rect(100, 100, 1200, 612);
-  requireThrows([&] { road_finder::validateConfig(outside); }, "inside the input",
-                "ROI outside image");
-
-  road_finder::Config short_roi;
-  short_roi.roi = cv::Rect(26, 86, 1229, 300);
-  requireThrows([&] { road_finder::validateConfig(short_roi); }, "80%",
-                "ROI not reaching the lower image");
-
-  road_finder::Config invalid_lab;
-  invalid_lab.road_hsv.v_min = 200;
-  invalid_lab.road_hsv.v_max = 100;
-  requireThrows([&] { road_finder::validateConfig(invalid_lab); }, "invalid HSV range",
-                "reversed HSV bounds");
-
-  road_finder::Config invalid_band;
-  invalid_band.left_marker_rois[0] = cv::Rect(0, 85, 128, 7);
-  requireThrows([&] { road_finder::validateConfig(invalid_band); }, "128x90",
-                "scan band outside reference image");
-
-  invalid_lab.road_hsv = {170, 10, 0, 255, 0, 255};
-  road_finder::validateConfig(invalid_lab);
-  invalid_lab.road_hsv.h_max = 180;
-  requireThrows([&] { road_finder::validateConfig(invalid_lab); }, "invalid HSV", "H upper bound");
-  for (int threads : {0, -1, std::numeric_limits<int>::max(), 100}) {
-    config.threads = threads;
-    requireThrows([&] { road_finder::RoadDetector detector(config); }, "threads", "invalid threads");
-  }
-
-  road_finder::Config field_config;
-  field_config.side_road_hsv = road_finder::HsvRange{0, 180, 0, 255, 0, 255};
-  requireThrows([&] { road_finder::validateConfig(field_config); }, "invalid HSV", "side range");
-  field_config.side_road_hsv.reset();
-  field_config.side_right_begin_reference = field_config.side_left_end_reference;
-  requireThrows([&] { road_finder::validateConfig(field_config); }, "boundaries", "overlapping sides");
-  field_config = road_finder::Config{};
-  field_config.marker_min_coverage = 0;
-  requireThrows([&] { road_finder::validateConfig(field_config); }, "fractions", "zero coverage");
-  field_config.marker_min_coverage = 0.35f;
-  field_config.occlusion_max_gap_fraction = std::numeric_limits<float>::quiet_NaN();
-  requireThrows([&] { road_finder::validateConfig(field_config); }, "fractions", "NaN gap");
-  field_config.occlusion_max_gap_fraction = 0.25f;
-  field_config.white_v_min = 256;
-  requireThrows([&] { road_finder::validateConfig(field_config); }, "white thresholds", "white bounds");
-
-  road_finder::Config invalid_mode;
-  invalid_mode.segmentation_mode = "unknown";
-  requireThrows([&] { road_finder::validateConfig(invalid_mode); }, "segmentation_mode",
-                "unsupported segmentation");
-  road_finder::Config invalid_contrast;
-  invalid_contrast.road_contrast_min = 0;
-  requireThrows([&] { road_finder::validateConfig(invalid_contrast); }, "road_contrast_min",
-                "zero contrast threshold");
-  road_finder::Config invalid_width;
-  invalid_width.min_road_width_fraction = invalid_width.max_road_width_fraction;
-  requireThrows([&] { road_finder::validateConfig(invalid_width); }, "width fractions",
-                "reversed width limits");
-  invalid_width.min_road_width_fraction = std::numeric_limits<float>::quiet_NaN();
-  requireThrows([&] { road_finder::validateConfig(invalid_width); }, "width fractions",
-                "non-finite width limit");
-  road_finder::Config invalid_temporal;
-  invalid_temporal.classification_confirm_frames = 0;
-  requireThrows([&] { road_finder::validateConfig(invalid_temporal); }, "frame counts",
-                "zero confirmation frames");
-  invalid_temporal.classification_confirm_frames = 3;
-  invalid_temporal.classification_hold_frames = 11;
-  requireThrows([&] { road_finder::validateConfig(invalid_temporal); }, "frame counts",
-                "excessive hold frames");
-  invalid_temporal.classification_hold_frames = 2;
-  invalid_temporal.geometry_smoothing_alpha = std::numeric_limits<float>::quiet_NaN();
-  requireThrows([&] { road_finder::validateConfig(invalid_temporal); }, "smoothing_alpha",
-                "non-finite smoothing coefficient");
-}
-
-void expectConfigFile() {
-  const std::string modern = writeConfig(
-      "config_test_modern.yaml",
-      "input_width: 1280\ninput_height: 720\nprocess_width: 640\n"
-      "roi: [10, 20, 300, 700]\nroad_hsv: [120, 170, 120, 150, 120, 150]\n"
-      "segmentation_mode: adaptive_dark\nroad_contrast_min: 22\n"
-      "min_road_width_fraction: 0.08\nmax_road_width_fraction: 0.75\n"
-      "classification_confirm_frames: 4\nclassification_hold_frames: 2\n"
-      "geometry_smoothing_alpha: 0.4\n"
-      "stop_detection_enabled: 1\nleft_marker_rois: [[11, 40, 10, 10], [11, 50, 10, 10], [11, 60, 10, 10]]\n");
-  const road_finder::Config loaded = road_finder::loadConfig(modern);
-  require(loaded.roi == cv::Rect(10, 20, 300, 700), "roi should be read in input pixels");
-  require(loaded.road_hsv.h_min == 120 && loaded.road_hsv.v_max == 150,
-          "road HSV range should be read");
-  require(loaded.stop_detection_enabled, "stop recognition toggle should be read");
-  require(loaded.left_marker_rois[1] == cv::Rect(11, 50, 10, 10),
-          "sample ROI override should be read");
-  require(loaded.segmentation_mode == "adaptive_dark" && loaded.road_contrast_min == 22,
-          "adaptive segmentation options should be read");
-  require(std::abs(loaded.min_road_width_fraction - 0.08f) < 1e-6f &&
-              std::abs(loaded.max_road_width_fraction - 0.75f) < 1e-6f,
-          "road width limits should be read");
-  require(loaded.classification_confirm_frames == 4 && loaded.classification_hold_frames == 2 &&
-              std::abs(loaded.geometry_smoothing_alpha - 0.4f) < 1e-6f,
-          "video confirmation and smoothing options should be read");
-  std::remove(modern.c_str());
-
-  const auto field = writeConfig("config_field.yaml",
-      "road_hsv: [90, 120, 20, 140, 100, 230]\n"
-      "side_road_hsv: [95, 130, 15, 180, 20, 160]\n"
-      "side_left_end_reference: 35\nside_right_begin_reference: 93\n"
-      "marker_min_coverage: 0.45\nwhite_s_max: 35\nwhite_v_min: 180\n"
-      "occlusion_max_gap_fraction: 0.2\ngeometry_min_span_fraction: 0.25\n");
-  const auto field_loaded = road_finder::loadConfig(field);
-  require(field_loaded.side_road_hsv && field_loaded.side_road_hsv->v_min == 20 &&
-              field_loaded.road_hsv.v_min == 100, "central and shared side HSV must be independent");
-  require(field_loaded.side_left_end_reference == 35 && field_loaded.side_right_begin_reference == 93 &&
-              std::abs(field_loaded.marker_min_coverage - 0.45f) < 1e-6f &&
-              field_loaded.white_s_max == 35 && field_loaded.white_v_min == 180 &&
-              std::abs(field_loaded.occlusion_max_gap_fraction - 0.2f) < 1e-6f &&
-              std::abs(field_loaded.geometry_min_span_fraction - 0.25f) < 1e-6f,
-          "field calibration controls must load");
-  std::remove(field.c_str());
-  const auto inherited = writeConfig("config_inherited.yaml", "road_hsv: [90,120,20,140,100,230]\n");
-  require(!road_finder::loadConfig(inherited).side_road_hsv,
-          "omitted side range must inherit the configured central range");
-  std::remove(inherited.c_str());
-
-  const std::string bad_height =
-      writeConfig("config_test_height.yaml", "process_height: 360\n");
-  requireThrows([&] { road_finder::loadConfig(bad_height); },
-                "process_height is no longer used", "deprecated process_height");
-  std::remove(bad_height.c_str());
-
-  const std::string bad_fraction = writeConfig(
-      "config_test_fraction.yaml", "roi_fraction: [0.02, 0.12, 0.96, 0.85]\n");
-  requireThrows([&] { road_finder::loadConfig(bad_fraction); },
-                "[26, 86, 1229, 612]", "deprecated roi_fraction");
-  std::remove(bad_fraction.c_str());
-
-  for (const char* key : {"road_lab", "stop_lab", "scan_bands", "left_marker_roi"}) {
-    const auto legacy = writeConfig("config_legacy.yaml", std::string(key) + ": [0, 255]\n");
-    requireThrows([&] { road_finder::loadConfig(legacy); }, "no longer supported", "legacy key");
-    std::remove(legacy.c_str());
-  }
-
-  const std::string bad_lab =
-      writeConfig("config_test_lab.yaml", "road_hsv: [200, 100, 0, 255, 0, 255]\n");
-  requireThrows([&] { road_finder::loadConfig(bad_lab); }, "invalid HSV range",
-                "reversed road HSV range");
-  std::remove(bad_lab.c_str());
-}
-
 }  // namespace
 
 int main() {
   try {
-    expectDefaultsAndValidation();
-    expectConfigFile();
+    Config value;
+    validateConfig(value);
+    require(value.processHeight() == 360, "defaults must retain input aspect ratio");
+    for (const cv::Rect rect : {cv::Rect(-1, 540, 200, 50), cv::Rect(400, 700, 200, 50),
+                               cv::Rect(400, 540, 0, 50), cv::Rect(1200, 540, 200, 50)}) {
+      value = Config{};
+      value.road_end_roi = rect;
+      rejected([&] { validateConfig(value); }, "road_end_roi");
+    }
+    value = Config{};
+    value.road_end_roi = {400, 0, 200, 50};
+    validateConfig(value);
+    for (float fraction : {0.0f, 1.1f, std::numeric_limits<float>::quiet_NaN()}) {
+      value = Config{}; value.occlusion_max_gap_fraction = fraction;
+      rejected([&] { validateConfig(value); }, "fractions");
+    }
+    for (int threads : {0, -1, 100, std::numeric_limits<int>::max()}) {
+      value = Config{}; value.threads = threads;
+      rejected([&] { RoadDetector detector(value); }, "threads");
+    }
+    value = Config{}; value.road_hsv = {170, 10, 0, 255, 0, 255};
+    validateConfig(value);
+    value.road_hsv.h_max = 180;
+    rejected([&] { validateConfig(value); }, "HSV");
+    for (const HsvRange range : {HsvRange{50, 20, 200, 40, 230, 80},
+                                HsvRange{0, 0, 0, 0, 0, 0},
+                                HsvRange{179, 179, 255, 255, 255, 255},
+                                HsvRange{0, 179, 0, 255, 0, 255}}) {
+      value = Config{};
+      value.road_hsv = range;
+      validateConfig(value);
+    }
+    const std::array<int HsvRange::*, 6> endpoints{{
+        &HsvRange::h_min, &HsvRange::h_max, &HsvRange::s_min,
+        &HsvRange::s_max, &HsvRange::v_min, &HsvRange::v_max}};
+    for (std::size_t i = 0; i < endpoints.size(); ++i) {
+      for (int invalid : {-1, i < 2 ? 180 : 256}) {
+        value = Config{};
+        value.road_hsv.*endpoints[i] = invalid;
+        rejected([&] { validateConfig(value); }, "HSV");
+      }
+    }
+    value = Config{}; value.min_road_width_fraction = value.max_road_width_fraction;
+    rejected([&] { validateConfig(value); }, "width fractions");
+    value = Config{}; value.white_v_min = 256;
+    rejected([&] { validateConfig(value); }, "white thresholds");
+    value = Config{}; value.roi.width = 1281;
+    rejected([&] { validateConfig(value); }, "inside the input");
+    value = Config{}; value.roi = {0, 0, 1280, 200};
+    rejected([&] { validateConfig(value); }, "80%");
+    for (const char* key : {"segmentation_mode", "road_contrast_min", "side_road_hsv",
+        "side_left_end_reference", "side_right_begin_reference", "marker_min_coverage",
+        "classification_confirm_frames", "classification_hold_frames", "left_marker_rois",
+        "right_marker_rois", "indicator_roi", "indicator_min_area_reference", "stop_roi",
+        "stop_hsv", "stop_min_area_reference", "stop_detection_enabled", "road_lab", "stop_lab",
+        "scan_bands", "left_marker_roi", "right_marker_roi"})
+      loadText(std::string(key) + ": 1\n", std::string(key) + " is no longer supported");
+    loadText("process_height: 360\n", "process_height is no longer used");
+    loadText("roi_fraction: [0.02, 0.12, 0.96, 0.85]\n", "[26, 86, 1229, 612]");
+    loadText("road_end_roi: [1, 2, 3]\n", "needs [x,y,width,height]");
+    loadText("road_hsv: [1, 2, 3]\n", "needs [H_min");
+    loadText("perspective_src: [[0,0], [639,0], [639,359], [0,359]]\n", "both perspective");
+    value = road_finder::test::config();
+    value.use_perspective = true;
+    value.perspective_src = {{{0,0}, {639,0}, {639,359}, {0,359}}};
+    value.perspective_dst = value.perspective_src;
+    value.perspective_dst[0].x = std::numeric_limits<float>::quiet_NaN();
+    rejected([&] { validateConfig(value); }, "finite");
+    value.perspective_dst = {{{0,0}, {639,359}, {639,0}, {0,359}}};
+    rejected([&] { validateConfig(value); }, "convex");
+    const std::string path = "config_test_modern.yaml";
+    {
+      std::ofstream file(path);
+      file << "%YAML:1.0\n---\ninput_width: 640\ninput_height: 360\nprocess_width: 320\n"
+              "roi: [0,180,640,180]\nroad_end_roi: [10,10,10,10]\n"
+              "road_end_confirm_frames: 4\nroad_end_min_coverage: 0.95\n"
+              "road_end_support_fraction: 0.1\nroad_hsv: [50,20,200,40,230,80]\n"
+              "geometry_min_span_fraction: 0.1\ngeometry_smoothing_alpha: 0.4\n"
+              "white_v_min: 180\n";
+    }
+    const auto loaded = loadConfig(path);
+    require(loaded.road_end_roi == cv::Rect(10,10,10,10) && loaded.processHeight() == 180 &&
+            loaded.road_hsv.h_min == 50 && loaded.road_hsv.h_max == 20 &&
+            loaded.road_hsv.s_min == 200 && loaded.road_hsv.s_max == 40 &&
+            loaded.road_hsv.v_min == 230 && loaded.road_hsv.v_max == 80 &&
+            loaded.white_v_min == 180,
+            "modern calibration must load in original pixels");
+    // Old 95% / four-frame tuning must not override the fixed 80% current-frame rule.
+    auto legacy = loaded;
+    legacy.process_width = 640;
+    cv::Mat mask = road_finder::test::road();
+    mask(legacy.road_end_roi).setTo(1);
+    for (int i = 0; i < 80; ++i)
+      mask.at<unsigned char>(10 + i / 10, 10 + i % 10) = 0;
+    const auto result = RoadDetector(legacy).processMask(mask, 1, true);
+    require(result.type == RoadType::RoadEnd && result.road_end_region.coverage == 0.8f,
+            "legacy endpoint keys must be ignored instead of delaying or tightening detection");
+    std::remove(path.c_str());
     std::cout << "config tests passed\n";
     return 0;
   } catch (const std::exception& error) {

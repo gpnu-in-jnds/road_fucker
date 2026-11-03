@@ -1,0 +1,9 @@
+%YAML:1.0
+---
+# Calibration for this cropped 640x480 sample only; not a 1280x720 camera preset.
+input_width: 640
+input_height: 480
+process_width: 640
+roi: [0, 240, 640, 240]
+road_hsv: [70, 20, 0, 40, 90, 255]
+road_end_roi: [160, 268, 320, 64]
