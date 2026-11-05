@@ -16,6 +16,7 @@ find_package(Threads REQUIRED)
 
 add_library(road_fucker_lib
     src/road_detector.cpp
+    src/centerline_filter.cpp
     src/occlusion.cpp
     src/worker_pool.cpp
     src/camera.cpp
@@ -32,7 +33,7 @@ target_compile_options(road_fucker PRIVATE -Wall -Wextra -Wpedantic)
 option(BUILD_TESTING "Build tests" OFF)
 include(CTest)
 if(BUILD_TESTING)
-  foreach(feature IN ITEMS road_detector field_conditions parallel_detection preview_window source config uart_packet)
+  foreach(feature IN ITEMS road_detector centerline_filter field_conditions parallel_detection preview_window source config uart_packet)
     add_executable(${feature}_test tests/${feature}_test.cpp)
     target_link_libraries(${feature}_test PRIVATE road_fucker_lib)
     target_compile_options(${feature}_test PRIVATE -Wall -Wextra -Wpedantic)

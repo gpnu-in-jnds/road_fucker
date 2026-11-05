@@ -5,6 +5,7 @@ input_height: 720
 process_width: 640
 
 # Original input-image pixels. --threads N splits the ROI into N * 6 strips.
+# Worker count and --display are CLI options, not YAML fields.
 roi: [0, 360, 1280, 360]
 # One fixed range for the entire view, calibrated under the final auxiliary light.
 # OpenCV HSV [Hmin,Hmax,Smin,Smax,Vmin,Vmax], inclusive endpoints.
@@ -13,14 +14,27 @@ roi: [0, 360, 1280, 360]
 # H in [70,179] OR [0,10]: retain low-H road patches, exclude H25..45 background.
 # Both hue intervals share S/V bounds; keep these calibrated for the actual camera.
 road_hsv: [70, 10, 10, 150, 40, 230]
+# End-color pixels ALSO contribute to measured centerline centroids.
+# Purple starting range; calibrate under the actual camera and auxiliary light.
+# Comment out or omit road_end_hsv to disable.
+# Same inclusive/wrapped H/S/V rules as road_hsv; not restricted to road_end_roi.
+# Endpoint non-road coverage still uses road_hsv alone.
+# If a purple pixel also matches road_hsv, it still counts as road for endpoint area.
+road_end_hsv: [125, 165, 50, 255, 40, 255]
 # Used only by white-occlusion diagnostics; they do not gate steering or RoadEnd.
 min_road_width_fraction: 0.06
 max_road_width_fraction: 0.85
 morphology_pixels: 3
 
+# Reject isolated centroids using the current frame's majority-supported line.
+# Horizontal residual is scaled by processing image width (0.025 * 640 = 16 px).
+centerline_filter:
+  enabled: 1
+  max_residual_fraction: 0.025
+
 # Trigger window in ORIGINAL input-image pixels; may lie outside the tracking roi.
 # Initial values only: calibrate against the camera angle and stopping distance.
-# RoadEnd: >=2 measured strip centroids and >=80% non-mask in this window, immediately.
+# RoadEnd: >=2 retained strip centroids and >=80% non-mask in this window, immediately.
 road_end_roi: [400, 540, 480, 120]
 
 # White candidates are NOT automatically occlusions or road ends.

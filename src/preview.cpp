@@ -4,6 +4,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -40,9 +41,28 @@ void drawRoadMask(const RoadResult& result, cv::Mat& canvas, double sx, double s
   }
 }
 
+void drawRoi(cv::Mat& canvas, const RoadResult& result, double sx, double sy) {
+  if (result.roi_polygon.size() != 4) return;
+  std::vector<cv::Point> polygon;
+  for (const auto& point : result.roi_polygon)
+    polygon.emplace_back(cvRound(point.x * sx), cvRound(point.y * sy));
+  cv::polylines(canvas, std::vector<std::vector<cv::Point>>{polygon}, true,
+                cv::Scalar(0, 255, 0), std::max(1, cvRound(2 * sx)), cv::LINE_AA);
+}
+
+void drawRejectedCenters(cv::Mat& canvas, const RoadResult& result, double sx, double sy) {
+  const int radius = std::max(2, cvRound(4 * sx));
+  for (const auto& block : result.scan_blocks) {
+    if (!block.found || block.fit_used) continue;
+    const cv::Point center(cvRound(block.midpoint.x * sx), cvRound(block.midpoint.y * sy));
+    cv::circle(canvas, center, radius + 1, {255, 255, 255}, -1, cv::LINE_AA);
+    cv::circle(canvas, center, radius, {0, 0, 0}, -1, cv::LINE_AA);
+  }
+}
+
 // Draw the mask first, keeping status, center points and end ROI unobscured.
 void drawInto(const cv::Mat& frame, const RoadResult& result, double scale,
-              cv::Mat& canvas) {
+              cv::Mat& canvas, bool draw_rejected) {
   if (scale >= 1.0) frame.copyTo(canvas);
   else cv::resize(frame, canvas,
       cv::Size(std::max(1, cvRound(frame.cols * scale)),
@@ -50,6 +70,7 @@ void drawInto(const cv::Mat& frame, const RoadResult& result, double scale,
   const double sx = static_cast<double>(canvas.cols) / frame.cols;
   const double sy = static_cast<double>(canvas.rows) / frame.rows;
   drawRoadMask(result, canvas, sx, sy);
+  drawRoi(canvas, result, sx, sy);
   const auto at = [sx, sy](const cv::Point2f& point) {
     return cv::Point(cvRound(point.x * sx), cvRound(point.y * sy));
   };
@@ -59,7 +80,7 @@ void drawInto(const cv::Mat& frame, const RoadResult& result, double scale,
                std::max(1, cvRound(2 * sx)), cv::LINE_AA);
   };
   for (const auto& block : result.scan_blocks)
-    if (block.found)
+    if (block.found && block.fit_used)
       cv::circle(canvas, at(block.midpoint), std::max(2, cvRound(4 * sx)),
                  {255, 0, 255}, -1, cv::LINE_AA);
   if (result.valid) {
@@ -89,49 +110,69 @@ void drawInto(const cv::Mat& frame, const RoadResult& result, double scale,
   cv::rectangle(canvas, panel, cv::Scalar::all(0), -1);
   cv::putText(canvas, status, origin, cv::FONT_HERSHEY_SIMPLEX,
               font, {255, 255, 255}, thickness, cv::LINE_AA);
+  if (draw_rejected) drawRejectedCenters(canvas, result, sx, sy);
 }
 
 }  // namespace
 
-cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result, bool full_process) {
+cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result, bool full_process,
+                       double scale) {
+  if (!std::isfinite(scale) || scale <= 0.0)
+    throw std::invalid_argument("preview scale must be finite and positive");
   cv::Mat output;
-  drawInto(frame, result, 1.0, output);
+  drawInto(frame, result, scale, output, !full_process);
   if (!full_process) return output;
 
-  // Each panel has input-frame dimensions. Mask stays in processing/warped
+  // Draw at the final preview size instead of shrinking already drawn points.
+  // Mask stays in processing/warped
   // coordinates; source overlays use inverse-transformed polygons and points.
-  cv::Mat montage(frame.rows * 2, frame.cols * 2, frame.type(), cv::Scalar::all(0));
-  frame.copyTo(montage(cv::Rect(0, 0, frame.cols, frame.rows)));
+  const int width = output.cols;
+  const int height = output.rows;
+  const double sx = static_cast<double>(width) / frame.cols;
+  const double sy = static_cast<double>(height) / frame.rows;
+  cv::Mat input;
+  cv::resize(frame, input, output.size(), 0, 0, cv::INTER_AREA);
+  cv::Mat montage(height * 2, width * 2, frame.type(), cv::Scalar::all(0));
+  input.copyTo(montage(cv::Rect(0, 0, width, height)));
   if (!result.road_mask.empty()) {
     cv::Mat color_mask(result.road_mask.size(), CV_8UC3, cv::Scalar::all(0)), resized;
     color_mask.setTo(cv::Scalar(0, 200, 0), result.road_mask);
+    if (!result.road_end_color_mask.empty())
+      color_mask.setTo(cv::Scalar(255, 255, 0), result.road_end_color_mask);
     if (!result.white_mask.empty()) color_mask.setTo(cv::Scalar(160, 160, 160), result.white_mask);
     if (!result.occlusion_mask.empty()) color_mask.setTo(cv::Scalar(180, 0, 180), result.occlusion_mask);
     if (!result.bridge_mask.empty()) color_mask.setTo(cv::Scalar(0, 165, 255), result.bridge_mask);
-    cv::resize(color_mask, resized, frame.size(), 0, 0, cv::INTER_NEAREST);
-    resized.copyTo(montage(cv::Rect(frame.cols, 0, frame.cols, frame.rows)));
+    cv::resize(color_mask, resized, output.size(), 0, 0, cv::INTER_NEAREST);
+    resized.copyTo(montage(cv::Rect(width, 0, width, height)));
   }
-  cv::Mat blocks = frame.clone();
+  cv::Mat blocks = input.clone();
   for (const auto& block : result.scan_blocks) {
     std::vector<cv::Point> polygon;
-    for (const auto& point : block.polygon) polygon.emplace_back(cvRound(point.x), cvRound(point.y));
+    for (const auto& point : block.polygon)
+      polygon.emplace_back(cvRound(point.x * sx), cvRound(point.y * sy));
     if (!polygon.empty())
       cv::polylines(blocks, std::vector<std::vector<cv::Point>>{polygon}, true,
                     cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-    if (block.found)
-      cv::circle(blocks, block.midpoint, 5, {255, 0, 255}, -1, cv::LINE_AA);
+    if (block.found && block.fit_used)
+      cv::circle(blocks, {cvRound(block.midpoint.x * sx), cvRound(block.midpoint.y * sy)},
+                  std::max(2, cvRound(5 * sx)), {255, 0, 255}, -1, cv::LINE_AA);
   }
-  blocks.copyTo(montage(cv::Rect(0, frame.rows, frame.cols, frame.rows)));
-  output.copyTo(montage(cv::Rect(frame.cols, frame.rows, frame.cols, frame.rows)));
-  const char* titles[] = {"INPUT", "ROAD: GREEN | WHITE: GRAY | OCCLUSION: PURPLE | BRIDGE: ORANGE", "BLOCKS / MEASURED CENTERS",
+  drawRoi(blocks, result, sx, sy);
+  blocks.copyTo(montage(cv::Rect(0, height, width, height)));
+  output.copyTo(montage(cv::Rect(width, height, width, height)));
+  const char* titles[] = {"INPUT", "ROAD GREEN | END CYAN | WHITE GRAY | GAP PURPLE | BRIDGE ORANGE", "CENTERS: USED PURPLE / EXCLUDED BLACK",
                           "CENTERLINE / ROAD END"};
   for (int i = 0; i < 4; ++i) {
-    const cv::Point origin((i % 2) * frame.cols, (i / 2) * frame.rows);
-    cv::rectangle(montage, cv::Rect(origin.x, origin.y, frame.cols, std::min(28, frame.rows)),
+    const cv::Point origin((i % 2) * width, (i / 2) * height);
+    cv::rectangle(montage, cv::Rect(origin.x, origin.y, width, std::min(std::max(1, cvRound(28 * sy)), height)),
                   cv::Scalar::all(0), -1);
-    cv::putText(montage, titles[i], origin + cv::Point(8, 20), cv::FONT_HERSHEY_SIMPLEX,
-                0.5, {255, 255, 255}, 1, cv::LINE_AA);
+    cv::putText(montage, titles[i], origin + cv::Point(cvRound(8 * sx), cvRound(20 * sy)),
+                cv::FONT_HERSHEY_SIMPLEX, std::max(0.25, 0.5 * sx), {255, 255, 255}, 1, cv::LINE_AA);
   }
+  auto block_panel = montage(cv::Rect(0, height, width, height));
+  auto final_panel = montage(cv::Rect(width, height, width, height));
+  drawRejectedCenters(block_panel, result, sx, sy);
+  drawRejectedCenters(final_panel, result, sx, sy);
   return montage;
 }
 
@@ -161,13 +202,7 @@ bool Preview::refreshDue(bool forced) const {
 bool Preview::show(const cv::Mat& frame, const RoadResult& result, int wait_ms) {
   // wait_ms == 0 means a single image is on screen and must be drawn once.
   if (refreshDue(wait_ms <= 0)) {
-    if (full_process_) {
-      const cv::Mat process_view = annotateResult(frame, result, true);
-      cv::resize(process_view, canvas_, cv::Size(std::max(1, cvRound(process_view.cols * scale_)),
-          std::max(1, cvRound(process_view.rows * scale_))), 0, 0, cv::INTER_AREA);
-    } else {
-      drawInto(frame, result, scale_, canvas_);
-    }
+    canvas_ = annotateResult(frame, result, full_process_, scale_);
     cv::imshow(kPreviewWindow, canvas_);
     last_draw_ = std::chrono::steady_clock::now();
     drawn_once_ = true;

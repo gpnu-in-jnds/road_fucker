@@ -114,8 +114,9 @@ void geometry() {
   t_junction(cv::Rect(0, 180, 401, 30)).setTo(255);
   t_junction(cv::Rect(300, 180, 41, 180)).setTo(255);
   const auto junction = detect(t_junction);
-  require(junction.valid && junction.scan_blocks.front().found && junction.centerline.size() == 6,
-          "a wide T-junction mask must contribute even without road-edge pairs");
+  require(junction.valid && junction.scan_blocks.front().found &&
+          !junction.scan_blocks.front().fit_used && junction.centerline.size() == 5,
+          "a wide T-junction crossbar remains measured but must not distort the supported stem");
   const double expected = 200.0;  // The centered stem is contained by the strip crossbar.
   require(std::abs(junction.scan_blocks.front().midpoint.x - expected) < 0.01,
           "T-junction block must use all mask pixels for its centroid");
@@ -207,8 +208,11 @@ void endpoints() {
   cv::Mat discontinuous = cv::Mat::zeros(360, 640, CV_8UC1);
   for (int i = 0; i < 6; ++i)
     discontinuous(cv::Rect(i % 2 ? 540 : 0, 180 + i * 30, 81, 30)).setTo(255);
-  require(detector.processMask(discontinuous, 201).type == RoadType::RoadEnd,
-          "fit residual, disconnection and edge contact must not add endpoint conditions");
+  require(detector.processMask(discontinuous, 201).type == RoadType::Unknown,
+          "conflicting point groups cannot provide retained geometry for RoadEnd");
+  value.centerline_filter.enabled = false;
+  require(RoadDetector(value).processMask(discontinuous, 201).type == RoadType::RoadEnd,
+          "disabled filtering preserves the original endpoint support rule");
 
   const auto normal = detect(road());
   require(normal.type == RoadType::Straight && !normal.road_end_detected,

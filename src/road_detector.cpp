@@ -1,4 +1,5 @@
 #include "road_finder/road_detector.hpp"
+#include "centerline_filter.hpp"
 #include "worker_pool.hpp"
 #include "occlusion.hpp"
 
@@ -152,10 +153,23 @@ Config loadConfig(const std::string& path) {
   readValue(root, "morphology_pixels", config.morphology_pixels);
   config.road_end_roi = readRect(root["road_end_roi"], "road_end_roi", config.road_end_roi);
   config.road_hsv = readHsvRange(root["road_hsv"], config.road_hsv, "road_hsv");
+  if (!root["road_end_hsv"].empty())
+    config.road_end_hsv = readHsvRange(root["road_end_hsv"], config.road_hsv, "road_end_hsv");
   readValue(root, "white_s_max", config.white_s_max);
   readValue(root, "white_v_min", config.white_v_min);
   readValue(root, "occlusion_max_gap_fraction", config.occlusion_max_gap_fraction);
   config.roi = readRect(root["roi"], "roi", config.roi);
+  const cv::FileNode filter = root["centerline_filter"];
+  if (!filter.empty()) {
+    if (!filter.isMap()) throw std::runtime_error("centerline_filter must be a mapping");
+    if (!filter["enabled"].empty()) {
+      const auto enabled = filter["enabled"];
+      if (!enabled.isInt() || (static_cast<int>(enabled) != 0 && static_cast<int>(enabled) != 1))
+        throw std::runtime_error("centerline_filter.enabled must be 0 or 1");
+      config.centerline_filter.enabled = static_cast<int>(enabled) != 0;
+    }
+    readValue(filter, "max_residual_fraction", config.centerline_filter.max_residual_fraction);
+  }
 
   const cv::FileNode src = root["perspective_src"];
   const cv::FileNode dst = root["perspective_dst"];
@@ -187,6 +201,8 @@ void validateConfig(const Config& config) {
     throw std::runtime_error("roi must reach at least 80% of the input height");
   if (!validHsvRange(config.road_hsv))
     throw std::runtime_error("invalid HSV range: H endpoints within [0,179], S/V endpoints within [0,255]");
+  if (config.road_end_hsv && !validHsvRange(*config.road_end_hsv))
+    throw std::runtime_error("invalid road_end_hsv: H endpoints within [0,179], S/V endpoints within [0,255]");
   const cv::Rect image_bounds(0, 0, config.input_width, config.input_height);
   if (config.road_end_roi.empty() || (config.road_end_roi & image_bounds) != config.road_end_roi)
     throw std::runtime_error("road_end_roi must be nonempty and inside the input image");
@@ -195,6 +211,10 @@ void validateConfig(const Config& config) {
   };
   if (!fraction(config.occlusion_max_gap_fraction))
     throw std::runtime_error("gap fractions must be within (0,1]");
+  if (!std::isfinite(config.centerline_filter.max_residual_fraction) ||
+      config.centerline_filter.max_residual_fraction <= 0.0 ||
+      config.centerline_filter.max_residual_fraction > 1.0)
+    throw std::runtime_error("centerline_filter.max_residual_fraction must be within (0,1]");
   if (config.white_s_max < 0 || config.white_s_max > 255 ||
       config.white_v_min < 0 || config.white_v_min > 255)
     throw std::runtime_error("white thresholds must be within [0,255]");
@@ -400,6 +420,13 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   RoadResult result;
   result.timestamp_ms = timestamp_ms;
   result.road_mask = mask.clone();
+  if (processed_bgr != nullptr && config_.road_end_hsv) {
+    // Like the white candidate threshold, use actual pixels in the processed
+    // view. These are measured fitting pixels, not synthetic bridge pixels.
+    result.road_end_color_mask = hsvMask(*processed_bgr, *config_.road_end_hsv);
+    cv::bitwise_and(result.road_end_color_mask, valid_view_mask_, result.road_end_color_mask);
+    cv::bitwise_or(result.road_mask, result.road_end_color_mask, result.road_mask);
+  }
   result.road_mask_to_source = mask_to_source_.clone();
   result.road_end_region.polygon = road_end_polygon_;
   result.road_end_region.processed_region = road_end_region_processed_;
@@ -408,9 +435,9 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
     result.white_mask = hsvMask(*processed_bgr,
         {0, 179, 0, config_.white_s_max, config_.white_v_min, 255});
     cv::bitwise_and(result.white_mask, valid_view_mask_, result.white_mask);
-    result.white_mask.setTo(0, mask);  // A measured road pixel is never unknown.
+    result.white_mask.setTo(0, result.road_mask);  // Measured fitting pixels are never unknown.
   }
-  const auto occlusion = findOcclusions(mask, result.white_mask, roi_processed_, config_);
+  const auto occlusion = findOcclusions(result.road_mask, result.white_mask, roi_processed_, config_);
   result.occlusion_mask = occlusion.unknown;
   result.bridge_mask = occlusion.bridges;
   result.occlusion_detected = cv::countNonZero(result.occlusion_mask) > 0;
@@ -426,7 +453,7 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   // All nonzero pixels contribute, including disconnected and edge-touching regions.
   workers_->run(block_count, [&](int i) {
     const cv::Rect& band = scan_bands_processed_[i];
-    const cv::Mat block_mask = mask(band);
+    const cv::Mat block_mask = result.road_mask(band);
     const cv::Rect bounds = cv::boundingRect(block_mask);
     if (bounds.empty()) return;
     const cv::Moments moments = cv::moments(block_mask, true);
@@ -440,11 +467,10 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
                   {static_cast<float>(band.x + moments.m10 / moments.m00),
                    static_cast<float>(band.y + moments.m01 / moments.m00)}};
   });
-  int valid_samples = 0;
   std::vector<cv::Point2f> points;
-  std::vector<int> widths_reference;
+  std::vector<int> sample_indices;
   points.reserve(samples.size());
-  widths_reference.reserve(samples.size());
+  sample_indices.reserve(samples.size());
   const double sx = static_cast<double>(mask.cols) / kReferenceWidth;
   for (int i = 0; i < block_count; ++i) {
     const Blob& sample = samples[i];
@@ -452,66 +478,59 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
     result.scan_blocks[i].found = true;
     result.scan_blocks[i].midpoint = sourcePoint(sample.center);
     points.push_back(sample.center);
-    widths_reference.push_back(std::max(1, cvRound(sample.bounds.width / sx)));
-    ++valid_samples;
+    sample_indices.push_back(i);
   }
 
-  if (valid_samples == 0) {
+  const auto fit = fitCenterline(points, mask.cols, config_.centerline_filter);
+  result.raw_point_count = static_cast<int>(points.size());
+  result.fit_point_count = static_cast<int>(fit.used.size());
+  result.centerline_filter_status = fit.status;
+  result.fit_residual_px = fit.rms;
+  if (fit.used.empty()) {
     detectRoadEnd(mask, false, result);
     return result;
   }
 
-  double mean_x = 0.0;
-  double mean_y = 0.0;
-  for (const cv::Point2f& point : points) {
-    mean_x += point.x;
-    mean_y += point.y;
+  std::vector<int> widths_reference;
+  double fill_sum = 0.0;
+  for (const auto i : fit.used) {
+    const int index = sample_indices[i];
+    result.scan_blocks[index].fit_used = true;
+    const Blob& sample = samples[index];
+    widths_reference.push_back(std::max(1, cvRound(sample.bounds.width / sx)));
+    fill_sum += static_cast<double>(sample.area) / sample.bounds.area();
   }
-  mean_x /= points.size();
-  mean_y /= points.size();
-  double numerator = 0.0;
-  double denominator = 0.0;
-  for (const cv::Point2f& point : points) {
-    numerator += (point.y - mean_y) * (point.x - mean_x);
-    denominator += (point.y - mean_y) * (point.y - mean_y);
-  }
-  const double dx_dy = denominator <= 1e-6 ? 0.0 : numerator / denominator;
 
-  const float bottom_x_reference = points.back().x / sx;
+  // With filtering enabled, steering follows the refitted line, including when
+  // the bottommost raw observation was rejected. Disabled keeps the legacy offset.
+  const double bottom_x = config_.centerline_filter.enabled
+      ? fit.xAt(points[fit.used.back()].y) : points.back().x;
+  const float bottom_x_reference = bottom_x / sx;
   const float offset_reference = bottom_x_reference - kReferenceWidth / 2.0f;
   std::sort(widths_reference.begin(), widths_reference.end());
   const float median_width = static_cast<float>(widths_reference[widths_reference.size() / 2]);
   result.lateral_error = offset_reference / std::max(1.0f, median_width / 2.0f);
-  double residual_squared = 0.0;
-  double fill_sum = 0.0;
-  for (const Blob& sample : samples) {
-    if (!sample.found) continue;
-    const double residual = sample.center.x - mean_x - dx_dy * (sample.center.y - mean_y);
-    residual_squared += residual * residual;
-    fill_sum += static_cast<double>(sample.area) / sample.bounds.area();
-  }
-  const double rms = std::sqrt(residual_squared / valid_samples);
-  const double fit_quality = 1.0 / (1.0 + rms / std::max(3.0, median_width * sx * 0.15));
+  const double fit_quality = 1.0 / (1.0 + fit.rms / std::max(3.0, median_width * sx * 0.15));
   result.confidence = static_cast<float>(
-      valid_samples / static_cast<double>(samples.size()) * fit_quality * fill_sum / valid_samples);
-  result.heading_error_rad = static_cast<float>(std::atan(-dx_dy));
+      fit.used.size() / static_cast<double>(samples.size()) * fit_quality * fill_sum / fit.used.size());
+  result.heading_error_rad = static_cast<float>(std::atan(-fit.dx_dy));
   result.valid = true;
 
   // One centroid cannot determine slope. In that case expose the vertical
   // line through it; with multiple strips, report the fitted line at each
-  // measured row. All points are returned in source-image coordinates.
-  if (points.size() == 1) {
-    const float x = points.front().x;
+  // retained row. All points are returned in source-image coordinates.
+  if (fit.used.size() == 1) {
+    const float x = points[fit.used.front()].x;
     result.centerline.push_back(sourcePoint(
         {x, static_cast<float>(roi_processed_.y)}));
     result.centerline.push_back(sourcePoint(
         {x, static_cast<float>(roi_processed_.y + roi_processed_.height - 1)}));
   }
   for (std::size_t i = 0; i < samples.size(); ++i) {
-    if (!samples[i].found) continue;
+    if (!result.scan_blocks[i].fit_used) continue;
     const float y = samples[i].center.y;
-    const float fitted_x = static_cast<float>(mean_x + dx_dy * (y - mean_y));
-    if (points.size() > 1) result.centerline.push_back(sourcePoint({fitted_x, y}));
+    const float fitted_x = static_cast<float>(fit.xAt(y));
+    if (fit.used.size() > 1) result.centerline.push_back(sourcePoint({fitted_x, y}));
     result.left_boundary.push_back(
         sourcePoint({static_cast<float>(samples[i].bounds.x), y}));
     result.right_boundary.push_back(
@@ -520,8 +539,10 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
 
   result.type = RoadType::Straight;
   result.classification_confidence = result.confidence;
-  // Count measured strip centroids, not the two endpoints of a single-point fallback.
-  detectRoadEnd(mask, valid_samples >= 2 && denominator > 1e-6, result);
+  // Count retained measurements, not rejected points or single-point fallback endpoints.
+  // End colors support geometry but must not fill the non-road area used by
+  // the endpoint trigger. The original road-only mask remains the evidence.
+  detectRoadEnd(mask, fit.used.size() >= 2 && fit.y_variance_sum > 1e-6, result);
   return result;
 }
 

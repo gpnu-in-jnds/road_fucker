@@ -61,9 +61,10 @@ class PreviewWindowState {
 };
 
 // Draws a translucent red road mask, measured/fitted centers, end box and status.
-// full_process selects a four-panel process montage; no frame-rate line.
+// full_process selects a four-panel process montage; scale downsizes before
+// drawing points so rejected black centers remain visible in small previews.
 cv::Mat annotateResult(const cv::Mat& frame, const RoadResult& result,
-                       bool full_process = false);
+                       bool full_process = false, double scale = 1.0);
 
 // Owns the preview window: creation, drawing, event loop and close detection.
 class Preview {

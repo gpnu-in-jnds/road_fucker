@@ -163,6 +163,10 @@ void printResult(const road_finder::RoadResult& r) {
             << ",\"occlusion_detected\":" << (r.occlusion_detected ? "true" : "false")
             << ",\"classification_confidence\":" << r.classification_confidence
             << ",\"confidence\":" << r.confidence
+            << ",\"raw_point_count\":" << r.raw_point_count
+            << ",\"fit_point_count\":" << r.fit_point_count
+            << ",\"centerline_filter_status\":\"" << r.centerline_filter_status << "\""
+            << ",\"fit_residual_px\":" << r.fit_residual_px
             << ",\"lateral_error\":" << r.lateral_error
             << ",\"heading_error_rad\":" << r.heading_error_rad
             << ",\"left_boundary\":";
@@ -171,6 +175,18 @@ void printResult(const road_finder::RoadResult& r) {
   printPoints(r.right_boundary);
   std::cout << ",\"centerline\":";
   printPoints(r.centerline);
+  std::cout << ",\"scan_blocks\":[";
+  for (std::size_t i = 0; i < r.scan_blocks.size(); ++i) {
+    if (i) std::cout << ',';
+    const auto& block = r.scan_blocks[i];
+    std::cout << "{\"found\":" << (block.found ? "true" : "false")
+              << ",\"fit_used\":" << (block.fit_used ? "true" : "false")
+              << ",\"midpoint\":";
+    if (block.found) std::cout << '[' << block.midpoint.x << ',' << block.midpoint.y << ']';
+    else std::cout << "null";
+    std::cout << '}';
+  }
+  std::cout << ']';
   std::cout << '}' << std::endl;
 }
 
@@ -368,7 +384,9 @@ int main(int argc, char** argv) {
     {
       std::ostringstream runtime;
       runtime << "runtime: segmentation " << "hsv"
-              << ", RoadEnd >=2 measured points and >=80% non-mask (current frame)"
+              << ", RoadEnd >=2 retained points and >=80% non-mask (current frame)"
+              << ", centerline filter " << (config.centerline_filter.enabled ? "on" : "off")
+              << " (residual <= " << config.centerline_filter.max_residual_fraction * config.process_width << " px)"
               << ", threads " << config.threads << ", ROI blocks " << config.threads * 6;
       if (options.display)
         runtime << ", preview " << cvRound(config.input_width * options.preview_scale * (options.full_process ? 2 : 1)) << 'x'

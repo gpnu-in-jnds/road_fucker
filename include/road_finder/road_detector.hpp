@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,11 @@ struct HsvRange {
   int v_min = 40, v_max = 230;
 };
 
+struct CenterlineFilterConfig {
+  bool enabled = true;
+  double max_residual_fraction = 0.025;  // Horizontal residual / processing image width.
+};
+
 struct Config {
   int input_width = 1280;
   int input_height = 720;
@@ -43,6 +49,7 @@ struct Config {
   bool use_perspective = false;
 
   HsvRange road_hsv{};
+  std::optional<HsvRange> road_end_hsv;  // Extra measured pixels for centerline fitting only.
   int white_s_max = 45;
   int white_v_min = 170;
   float occlusion_max_gap_fraction = 0.25f;
@@ -52,6 +59,7 @@ struct Config {
   cv::Rect road_end_roi{400, 540, 480, 120};
   int threads = 1;  // Worker count; the ROI has threads * 6 horizontal strips.
   int morphology_pixels = 3;
+  CenterlineFilterConfig centerline_filter;
 
   int processHeight() const {
     return static_cast<int>(std::lround(static_cast<double>(input_height) * process_width /
@@ -66,6 +74,7 @@ struct BlockObservation {
   cv::Rect processed_region;
   std::vector<cv::Point2f> polygon;  // Original input-image coordinates.
   bool found = false;
+  bool fit_used = false;  // Measured scan point retained for the final centerline.
   float coverage = 0.0f;  // Strip mask fill; road_end_region uses the non-mask area fraction.
   cv::Point2f midpoint{};  // Geometric centroid of all nonzero mask pixels in this strip.
 };
@@ -76,8 +85,12 @@ struct RoadResult {
   RoadType type = RoadType::Unknown;
   RoadType raw_type = RoadType::Unknown;
   float confidence = 0.0f;
+  int raw_point_count = 0;
+  int fit_point_count = 0;
+  std::string centerline_filter_status = "no_points";
+  double fit_residual_px = 0.0;  // RMS horizontal residual of retained points in processing pixels.
   float classification_confidence = 0.0f;
-  bool road_end_detected = false;  // Two measured centroids and >=80% non-mask in the end box.
+  bool road_end_detected = false;  // Two retained centroids and >=80% non-mask in the end box.
   BlockObservation road_end_region;
   std::vector<cv::Point2f> road_end_boundary;  // Retained for compatibility; area detection leaves empty.
   bool occlusion_detected = false;
@@ -90,7 +103,8 @@ struct RoadResult {
   cv::Mat white_mask;  // Color candidates; not all white pixels are occlusions.
   cv::Mat occlusion_mask;  // White inside a geometrically supported road corridor.
   cv::Mat bridge_mask;  // Association only; never used for measured centers.
-  cv::Mat road_mask;  // Optional debug image, at process resolution.
+  cv::Mat road_mask;  // Combined road/end-color fitting mask at process resolution.
+  cv::Mat road_end_color_mask;  // HSV-matched end pixels; empty when not configured/no BGR.
   // Homography from road_mask to original input pixels. Empty: resize only.
   cv::Mat road_mask_to_source;
   std::vector<cv::Point2f> roi_polygon;

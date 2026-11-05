@@ -32,7 +32,25 @@ int main() {
   try {
     Config value;
     validateConfig(value);
+    require(!value.road_end_hsv, "end-color fitting must be opt-in");
+    loadText("road_end_hsv: [10,20]\n", "road_end_hsv needs");
+    loadText("road_end_hsv: [0,180,0,255,0,255]\n", "invalid road_end_hsv");
+    loadText("road_end_hsv: [0,179,0,256,0,255]\n", "invalid road_end_hsv");
+    loadText("road_end_hsv: [0,179,0,255,-1,255]\n", "invalid road_end_hsv");
     require(value.processHeight() == 360, "defaults must retain input aspect ratio");
+    require(value.centerline_filter.enabled &&
+            std::abs(value.centerline_filter.max_residual_fraction - 0.025) < 1e-12,
+            "centerline filter defaults must enable a width-relative 2.5% tolerance");
+    for (double fraction : {0.0, -0.1, 1.1, std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::quiet_NaN()}) {
+      auto invalid = value;
+      invalid.centerline_filter.max_residual_fraction = fraction;
+      rejected([&] { validateConfig(invalid); }, "centerline_filter.max_residual_fraction");
+    }
+    loadText("centerline_filter: 1\n", "centerline_filter must be a mapping");
+    loadText("centerline_filter:\n  enabled: 2\n", "centerline_filter.enabled");
+    loadText("centerline_filter:\n  enabled: 0.5\n", "centerline_filter.enabled");
+    loadText("centerline_filter:\n  max_residual_fraction: -0.1\n", "centerline_filter.max_residual_fraction");
     for (const cv::Rect rect : {cv::Rect(-1, 540, 200, 50), cv::Rect(400, 700, 200, 50),
                                cv::Rect(400, 540, 0, 50), cv::Rect(1200, 540, 200, 50)}) {
       value = Config{};
@@ -109,14 +127,23 @@ int main() {
               "road_end_support_fraction: 0.1\nroad_hsv: [50,20,200,40,230,80]\n"
               "geometry_min_span_fraction: 0.1\ngeometry_smoothing_alpha: 0.4\n"
               "white_v_min: 180\n";
+      file << "centerline_filter:\n  enabled: 0\n  max_residual_fraction: 0.04\n";
+      file << "road_end_hsv: [50,20,200,40,230,80]\n";
     }
     const auto loaded = loadConfig(path);
+    require(loaded.road_end_hsv && loaded.road_end_hsv->h_min == 50 &&
+            loaded.road_end_hsv->h_max == 20 && loaded.road_end_hsv->s_min == 200 &&
+            loaded.road_end_hsv->s_max == 40 && loaded.road_end_hsv->v_min == 230 &&
+            loaded.road_end_hsv->v_max == 80, "end HSV must preserve all reversed channel bounds");
     require(loaded.road_end_roi == cv::Rect(10,10,10,10) && loaded.processHeight() == 180 &&
             loaded.road_hsv.h_min == 50 && loaded.road_hsv.h_max == 20 &&
             loaded.road_hsv.s_min == 200 && loaded.road_hsv.s_max == 40 &&
             loaded.road_hsv.v_min == 230 && loaded.road_hsv.v_max == 80 &&
             loaded.white_v_min == 180,
             "modern calibration must load in original pixels");
+    require(!loaded.centerline_filter.enabled &&
+            std::abs(loaded.centerline_filter.max_residual_fraction - 0.04) < 1e-12,
+            "filter toggle and residual tolerance must load from YAML");
     // Old 95% / four-frame tuning must not override the fixed 80% current-frame rule.
     auto legacy = loaded;
     legacy.process_width = 640;

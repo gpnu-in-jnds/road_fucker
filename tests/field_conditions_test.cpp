@@ -134,6 +134,62 @@ void occlusion() {
   require(outside.valid && !outside.occlusion_detected && !outside.road_end_detected,
           "white floor outside the corridor must not be treated as an obstruction");
 }
+
+void endColorGeometry() {
+  auto value = config();
+  const auto end_color = hsvColor(35);
+  const auto frame = image(road(), {160,160,160}, end_color);
+  const auto disabled = RoadDetector(value).process(frame, 1);
+  require(!disabled.valid && disabled.road_end_color_mask.empty(),
+          "without end HSV, previously excluded color remains excluded");
+  value.road_end_hsv = HsvRange{25,45,80,120,160,200};
+  for (int threads : {1,2,4}) {
+    value.threads = threads;
+    const auto result = RoadDetector(value).process(frame, 1);
+    require(result.valid && result.fit_point_count == 6 * threads &&
+            std::abs(result.lateral_error) < 1e-6 && std::abs(result.heading_error_rad) < 1e-6,
+            "end-color measurements must supply centered geometry at every worker count");
+    require(result.type == RoadType::RoadEnd && result.road_end_region.coverage == 1.0f &&
+            result.road_mask.at<unsigned char>(250,320) &&
+            result.road_end_color_mask.at<unsigned char>(250,320),
+            "end colors fill the fitting mask without filling endpoint non-road evidence");
+    const auto mask_only = RoadDetector(value).processMask(cv::Mat::zeros(360,640,CV_8UC1), 2);
+    require(!mask_only.valid && mask_only.road_end_color_mask.empty(),
+            "mask-only input must not fabricate HSV measurements");
+  }
+  value.threads = 1;
+  const auto end_result = RoadDetector(value).process(frame, 1);
+  const auto process = annotateResult(frame, end_result, true);
+  require(process.at<cv::Vec3b>(250,640 + 320) == cv::Vec3b(255,255,0),
+          "process preview must distinguish measured end-color pixels in cyan");
+  cv::imwrite("end_hsv_process.png", process);
+  cv::Mat mixed = image(road());
+  mixed(cv::Rect(280,300,81,60)).setTo(end_color);
+  const auto combined = RoadDetector(value).process(mixed, 1);
+  require(combined.valid && combined.fit_point_count == 6 &&
+          combined.type == RoadType::Straight && combined.road_end_region.coverage == 0.0f,
+          "end-colored road outside the endpoint box must still contribute to fitting");
+  cv::Mat shifted = image(road());
+  shifted.rowRange(178,212).setTo(cv::Scalar(160,160,160));
+  shifted(cv::Rect(80,183,41,24)).setTo(end_color);
+  const auto filtered = RoadDetector(value).process(shifted, 1);
+  require(filtered.scan_blocks[0].found && !filtered.scan_blocks[0].fit_used &&
+          filtered.fit_point_count == 5 && std::abs(filtered.lateral_error) < 1e-6,
+          "end-color measurements must still pass the common outlier filter");
+  value.road_end_hsv = HsvRange{0,179,0,255,0,255};
+  value.use_perspective = true;
+  value.perspective_src = {{{0,0},{639,0},{639,359},{0,359}}};
+  value.perspective_dst = {{{100,0},{739,0},{739,359},{100,359}}};
+  const auto warped = RoadDetector(value).process(frame, 1);
+  require(cv::countNonZero(warped.road_end_color_mask(cv::Rect(0,0,100,360))) == 0,
+          "black perspective padding must never become measured end color");
+  value.use_perspective = false;
+  value.road_end_hsv = HsvRange{0,179,0,45,170,255};
+  const auto white_end = RoadDetector(value).process(image(road(), {70,70,70}, {240,240,240}), 1);
+  require(white_end.valid && white_end.white_mask.at<unsigned char>(250,320) == 0 &&
+          white_end.road_end_color_mask.at<unsigned char>(250,320),
+          "configured end measurements take precedence over white occlusion candidates");
+}
 }  // namespace
 
 int main() {
@@ -141,6 +197,7 @@ int main() {
     fixedHsv();
     crossZeroRoad();
     occlusion();
+    endColorGeometry();
     std::cout << "field conditions tests passed\n";
     return 0;
   } catch (const std::exception& error) {

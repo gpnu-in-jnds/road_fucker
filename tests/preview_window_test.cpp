@@ -90,12 +90,15 @@ void expectMinimalOverlay() {
   end.centerline = {{320,200}, {320,350}};
   end.scan_blocks.resize(1);
   end.scan_blocks[0].found = true;
+  end.scan_blocks[0].fit_used = true;
   end.scan_blocks[0].midpoint = {320,240};
   const auto normal = annotateResult(frame, end);
   require(normal.at<cv::Vec3b>(270,200)[1] > 200, "confirmed end box must be green");
-  require(cv::countNonZero(normal(cv::Rect(0,150,100,210)).reshape(1)) == 0 &&
-          cv::countNonZero(normal(cv::Rect(540,150,100,210)).reshape(1)) == 0,
-          "left/right boundaries and main ROI must not appear");
+  require(normal.at<cv::Vec3b>(200,50) == cv::Vec3b(0,0,0) &&
+          normal.at<cv::Vec3b>(200,590) == cv::Vec3b(0,0,0),
+          "left/right road boundaries must not appear");
+  require(normal.at<cv::Vec3b>(180,100)[1] > 200,
+          "tracking ROI must appear in green");
   require(cv::countNonZero(normal(cv::Rect(310,230,20,20)).reshape(1)) > 0,
           "measured/fitted center points must remain visible");
   end.type = RoadType::Straight;
@@ -143,6 +146,74 @@ void expectRoadMaskOverlay() {
   cv::imwrite("threshold_overlay.png", output);
 }
 
+void expectRejectedCenters() {
+  using namespace road_finder;
+  const cv::Mat frame(360, 640, CV_8UC3, cv::Scalar::all(40));
+  RoadResult result;
+  result.valid = true;
+  result.type = RoadType::Straight;
+  result.road_mask = cv::Mat(360, 640, CV_8UC1, cv::Scalar(255));
+  result.centerline = {{320,180}, {320,320}};
+  result.road_end_region.polygon = {{200,240}, {440,240}, {440,330}, {200,330}};
+  result.scan_blocks.resize(3);
+  result.scan_blocks[0].found = result.scan_blocks[0].fit_used = true;
+  result.scan_blocks[0].midpoint = {240,280};
+  result.scan_blocks[1].found = true;
+  result.scan_blocks[1].midpoint = {320,240};  // Overlaps both line and end-box edge.
+  result.scan_blocks[2].midpoint = {480,280};  // Missing observations must not be drawn.
+  for (double scale : {1.0, 0.5, 0.25}) {
+    const auto normal = annotateResult(frame, result, false, scale);
+    const auto montage = annotateResult(frame, result, true, scale);
+    const int x = cvRound(320 * scale), y = cvRound(240 * scale);
+    require(normal.at<cv::Vec3b>(y,x) == cv::Vec3b(0,0,0),
+            "rejected black center must cover road tint, green line and end-box edge at every scale");
+    const int radius = std::max(2, cvRound(4 * scale));
+    const auto outline = normal.at<cv::Vec3b>(y, x + radius + 1);
+    require(outline[0] > 150 && outline[1] > 150 && outline[2] > 150,
+            "black points need a light outline on dark backgrounds");
+    require(normal.at<cv::Vec3b>(cvRound(280 * scale), cvRound(240 * scale)) == cv::Vec3b(255,0,255),
+            "retained centers remain purple");
+    require(normal.at<cv::Vec3b>(cvRound(280 * scale), cvRound(480 * scale)) != cv::Vec3b(0,0,0),
+            "missing observations must not appear as black points");
+    require(montage.at<cv::Vec3b>(normal.rows + y,x) == cv::Vec3b(0,0,0) &&
+            montage.at<cv::Vec3b>(normal.rows + y,normal.cols + x) == cv::Vec3b(0,0,0),
+            "both measurement and final process panels must show rejected points");
+    const cv::Rect below_title(0, cvRound(100 * scale), normal.cols, normal.rows - cvRound(100 * scale));
+    require(cv::norm(normal(below_title),
+                     montage(below_title + cv::Point(normal.cols, normal.rows)), cv::NORM_INF) == 0,
+            "scaled final montage must share normal preview rendering");
+  }
+  result.valid = false;
+  result.type = RoadType::Unknown;
+  result.scan_blocks[0].fit_used = false;
+  const auto unknown = annotateResult(frame, result);
+  require(unknown.at<cv::Vec3b>(240,320) == cv::Vec3b(0,0,0) &&
+          unknown.at<cv::Vec3b>(280,240) == cv::Vec3b(0,0,0),
+          "Unknown must still show all excluded observations");
+}
+
+void expectRoiOverlay() {
+  using namespace road_finder;
+  const cv::Mat frame(360, 640, CV_8UC3, cv::Scalar::all(80));
+  RoadResult result;
+  // Non-axis-aligned source polygon, as returned after inverse perspective mapping.
+  result.roi_polygon = {{80,120}, {560,160}, {520,320}, {120,280}};
+  result.scan_blocks.resize(1);
+  result.scan_blocks[0].found = true;
+  result.scan_blocks[0].midpoint = {320,140};
+  for (double scale : {1.0, 0.5}) {
+    const auto output = annotateResult(frame, result, false, scale);
+    const auto process = annotateResult(frame, result, true, scale);
+    const int x = cvRound(200 * scale), y = cvRound(130 * scale);
+    require(output.at<cv::Vec3b>(y,x)[1] > 200 &&
+            process.at<cv::Vec3b>(y + output.rows,x)[1] > 200 &&
+            process.at<cv::Vec3b>(y + output.rows,x + output.cols)[1] > 200,
+            "source ROI polygon must align in normal, block and final panels at preview scale");
+    require(output.at<cv::Vec3b>(cvRound(140 * scale),cvRound(320 * scale)) == cv::Vec3b(0,0,0),
+            "excluded black point must remain on top of green ROI");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -155,6 +226,8 @@ int main() {
     expectProbeWindow();
     expectMinimalOverlay();
     expectRoadMaskOverlay();
+    expectRejectedCenters();
+    expectRoiOverlay();
     std::cout << "preview window tests passed\n";
     return 0;
   } catch (const std::exception& error) {
