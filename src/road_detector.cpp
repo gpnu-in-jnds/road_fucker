@@ -422,7 +422,7 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   result.road_mask = mask.clone();
   if (processed_bgr != nullptr && config_.road_end_hsv) {
     // Like the white candidate threshold, use actual pixels in the processed
-    // view. These are measured fitting pixels, not synthetic bridge pixels.
+    // view. These measured road pixels support both fitting and endpoint coverage.
     result.road_end_color_mask = hsvMask(*processed_bgr, *config_.road_end_hsv);
     cv::bitwise_and(result.road_end_color_mask, valid_view_mask_, result.road_end_color_mask);
     cv::bitwise_or(result.road_mask, result.road_end_color_mask, result.road_mask);
@@ -487,7 +487,7 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   result.centerline_filter_status = fit.status;
   result.fit_residual_px = fit.rms;
   if (fit.used.empty()) {
-    detectRoadEnd(mask, false, result);
+    detectRoadEnd(false, result);
     return result;
   }
 
@@ -540,17 +540,15 @@ RoadResult RoadDetector::analyzeMask(const cv::Mat& mask, std::int64_t timestamp
   result.type = RoadType::Straight;
   result.classification_confidence = result.confidence;
   // Count retained measurements, not rejected points or single-point fallback endpoints.
-  // End colors support geometry but must not fill the non-road area used by
-  // the endpoint trigger. The original road-only mask remains the evidence.
-  detectRoadEnd(mask, fit.used.size() >= 2 && fit.y_variance_sum > 1e-6, result);
+  // Fitting and endpoint coverage share the measured road/end-color union.
+  detectRoadEnd(fit.used.size() >= 2 && fit.y_variance_sum > 1e-6, result);
   return result;
 }
 
-void RoadDetector::detectRoadEnd(const cv::Mat& mask, bool can_fit_line,
-                                 RoadResult& result) const {
+void RoadDetector::detectRoadEnd(bool can_fit_line, RoadResult& result) const {
   if (road_end_valid_pixels_ == 0) return;
   cv::Mat road_pixels;
-  cv::compare(mask(road_end_region_processed_), cv::Scalar(0), road_pixels, cv::CMP_NE);
+  cv::compare(result.road_mask(road_end_region_processed_), cv::Scalar(0), road_pixels, cv::CMP_NE);
   cv::bitwise_and(road_pixels, road_end_view_mask_(road_end_region_processed_), road_pixels);
   const int non_mask_pixels = road_end_valid_pixels_ - cv::countNonZero(road_pixels);
   const float coverage = static_cast<float>(non_mask_pixels) / road_end_valid_pixels_;

@@ -149,10 +149,10 @@ void endColorGeometry() {
     require(result.valid && result.fit_point_count == 6 * threads &&
             std::abs(result.lateral_error) < 1e-6 && std::abs(result.heading_error_rad) < 1e-6,
             "end-color measurements must supply centered geometry at every worker count");
-    require(result.type == RoadType::RoadEnd && result.road_end_region.coverage == 1.0f &&
+    require(result.type == RoadType::Straight && result.road_end_region.coverage == 0.0f &&
             result.road_mask.at<unsigned char>(250,320) &&
             result.road_end_color_mask.at<unsigned char>(250,320),
-            "end colors fill the fitting mask without filling endpoint non-road evidence");
+            "end colors must count as road for both fitting and endpoint coverage");
     const auto mask_only = RoadDetector(value).processMask(cv::Mat::zeros(360,640,CV_8UC1), 2);
     require(!mask_only.valid && mask_only.road_end_color_mask.empty(),
             "mask-only input must not fabricate HSV measurements");
@@ -190,6 +190,60 @@ void endColorGeometry() {
           white_end.road_end_color_mask.at<unsigned char>(250,320),
           "configured end measurements take precedence over white occlusion candidates");
 }
+
+void purpleEndCoverage() {
+  auto value = config();
+  const auto purple = hsvColor(145, 220, 180);  // Outside road_hsv's saturation range.
+  cv::Mat frame = image(road());
+  // Include a margin so Gaussian preprocessing cannot mix background into the box.
+  frame(cv::Rect(276,236,89,58)).setTo(purple);
+  const auto disabled = RoadDetector(value).process(frame, 1);
+  require(disabled.valid && disabled.road_end_detected && disabled.road_end_region.coverage == 1,
+          "unconfigured purple is excluded from the base road segmentation");
+  value.road_end_hsv = HsvRange{125,165,50,255,40,255};
+  for (int threads : {1,2,4}) {
+    for (bool perspective : {false,true}) {
+      value.threads = threads;
+      value.use_perspective = perspective;
+      value.perspective_src = {{{0,0},{639,0},{639,359},{0,359}}};
+      value.perspective_dst = {{{100,0},{739,0},{739,359},{100,359}}};
+      RoadDetector detector(value);
+      const auto covered = detector.process(frame, 10, true);
+      require(covered.valid && covered.type == RoadType::Straight && !covered.road_end_detected &&
+              covered.road_end_region.coverage == 0,
+              "purple endpoint pixels must be road across threads and perspective views");
+      cv::Mat mixed = frame.clone();
+      mixed(cv::Rect(276,236,89,30)).setTo(cv::Scalar(150,100,80));
+      const auto combined = detector.process(mixed, 20, true);
+      require(combined.valid && !combined.road_end_detected && combined.road_end_region.coverage == 0,
+              "base-road and purple pixels jointly fill the endpoint box");
+      cv::Mat background = frame.clone();
+      background(cv::Rect(276,236,89,58)).setTo(cv::Scalar(160,160,160));
+      const auto ended = detector.process(background, 30, true);
+      require(ended.valid && ended.road_end_detected && ended.road_end_region.coverage == 1,
+              "actual background must still trigger RoadEnd with end HSV configured");
+      background(cv::Rect(276,236,89,8)).setTo(purple);
+      const auto small_patch = detector.process(background, 40, true);
+      require(small_patch.valid && small_patch.road_end_detected &&
+              small_patch.road_end_region.coverage >= 0.8f && small_patch.road_end_region.coverage < 1,
+              "a small purple patch reduces non-road area but does not veto a real end");
+      const auto recovered = detector.process(frame, 50, true);
+      require(recovered.valid && !recovered.road_end_detected,
+              "a purple surface returning to the box immediately clears RoadEnd");
+      if (threads == 1 && !perspective)
+        cv::imwrite("purple_end_coverage_process.png", annotateResult(frame, covered, true));
+    }
+  }
+  // Coverage must also use the union when no tracking geometry is available.
+  value = config();
+  value.road_end_roi = {280,40,80,50};  // Outside the tracking ROI.
+  value.road_end_hsv = HsvRange{125,165,50,255,40,255};
+  cv::Mat only_end(360,640,CV_8UC3,cv::Scalar(160,160,160));
+  only_end(cv::Rect(276,36,89,58)).setTo(purple);
+  const auto no_line = RoadDetector(value).process(only_end, 1);
+  require(!no_line.valid && no_line.type == RoadType::Unknown && no_line.road_end_region.coverage == 0,
+          "no-fit diagnostics must also count end-colored pixels as road");
+}
 }  // namespace
 
 int main() {
@@ -198,6 +252,7 @@ int main() {
     crossZeroRoad();
     occlusion();
     endColorGeometry();
+    purpleEndCoverage();
     std::cout << "field conditions tests passed\n";
     return 0;
   } catch (const std::exception& error) {

@@ -14,12 +14,12 @@ roi: [0, 360, 1280, 360]
 # H in [70,179] OR [0,10]: retain low-H road patches, exclude H25..45 background.
 # Both hue intervals share S/V bounds; keep these calibrated for the actual camera.
 road_hsv: [70, 10, 10, 150, 40, 230]
-# End-color pixels ALSO contribute to measured centerline centroids.
+# End-color pixels count as road for both centerline centroids and RoadEnd coverage.
 # Purple starting range; calibrate under the actual camera and auxiliary light.
 # Comment out or omit road_end_hsv to disable.
 # Same inclusive/wrapped H/S/V rules as road_hsv; not restricted to road_end_roi.
-# Endpoint non-road coverage still uses road_hsv alone.
-# If a purple pixel also matches road_hsv, it still counts as road for endpoint area.
+# Endpoint non-road coverage uses the union of road_hsv and road_end_hsv.
+# Purple pixels matching either range are road, not endpoint background.
 road_end_hsv: [125, 165, 50, 255, 40, 255]
 # Used only by white-occlusion diagnostics; they do not gate steering or RoadEnd.
 min_road_width_fraction: 0.06

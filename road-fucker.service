@@ -1,0 +1,31 @@
+# 在 RDK X5 上安装前，按实际情况修改 User、SupplementaryGroups、
+# WorkingDirectory 和 ExecStart 中的项目路径、摄像头及串口设备。
+# 以下示例使用 sunrise 用户，项目位于 /home/sunrise/road_fucker。
+# 可用 ls -l /dev/video0 /dev/ttyS1 核对设备所属权限组。
+#
+# 在设备上的项目根目录执行：
+#   sudo install -m 644 road-fucker.service /etc/systemd/system/road-fucker.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now road-fucker.service
+# 查看日志：journalctl -u road-fucker.service -b -f
+# 修改 YAML 或更新程序后：sudo systemctl restart road-fucker.service
+
+[Unit]
+Description=Road detection and UART output
+After=local-fs.target
+# 设备尚未就绪时允许持续重试，避免达到启动频率限制后停止重启。
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=sunrise
+SupplementaryGroups=video dialout
+WorkingDirectory=/home/sunrise/road_fucker
+ExecStart=/home/sunrise/road_fucker/build/road_fucker --config /home/sunrise/road_fucker/config/road_finder.yaml --source /dev/video0 --serial-device /dev/ttyS1 --no-display
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -49,7 +49,7 @@ struct Config {
   bool use_perspective = false;
 
   HsvRange road_hsv{};
-  std::optional<HsvRange> road_end_hsv;  // Extra measured pixels for centerline fitting only.
+  std::optional<HsvRange> road_end_hsv;  // Extra road pixels for fitting and RoadEnd coverage.
   int white_s_max = 45;
   int white_v_min = 170;
   float occlusion_max_gap_fraction = 0.25f;
@@ -103,7 +103,7 @@ struct RoadResult {
   cv::Mat white_mask;  // Color candidates; not all white pixels are occlusions.
   cv::Mat occlusion_mask;  // White inside a geometrically supported road corridor.
   cv::Mat bridge_mask;  // Association only; never used for measured centers.
-  cv::Mat road_mask;  // Combined road/end-color fitting mask at process resolution.
+  cv::Mat road_mask;  // Combined road/end-color mask for fitting and RoadEnd coverage.
   cv::Mat road_end_color_mask;  // HSV-matched end pixels; empty when not configured/no BGR.
   // Homography from road_mask to original input pixels. Empty: resize only.
   cv::Mat road_mask_to_source;
@@ -147,7 +147,7 @@ class RoadDetector {
   cv::Mat segment(const cv::Mat& view) const;
   RoadResult analyzeMask(const cv::Mat& mask, std::int64_t timestamp_ms,
                          const cv::Mat* processed_bgr);
-  void detectRoadEnd(const cv::Mat& mask, bool can_fit_line, RoadResult& result) const;
+  void detectRoadEnd(bool can_fit_line, RoadResult& result) const;
   cv::Point2f sourcePoint(const cv::Point2f& processed) const;
 };
 
